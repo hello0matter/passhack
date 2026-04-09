@@ -1,0 +1,50 @@
+{
+  "saved_at": "2026-04-09T10:57:58",
+  "reason": "test",
+  "source_file": "D:\\tmp\\a.xlsx",
+  "mode": "规则模式",
+  "use_proxy": false,
+  "proxy": "",
+  "capture": true,
+  "follow_redirect": true,
+  "filter": "全部",
+  "is_scanning": false,
+  "records": [
+    {
+      "record_id": 1,
+      "target": "http://a",
+      "final_url": "",
+      "status": "已完成",
+      "title": "",
+      "risk_level": "-",
+      "result": "-",
+      "login_score": 0,
+      "login_form": false,
+      "password_field_count": 0,
+      "captcha_present": false,
+      "mfa_present": false,
+      "lockout_hint": false,
+      "default_hint": false,
+      "screenshot_path": "",
+      "error": ""
+    },
+    {
+      "record_id": 2,
+      "target": "http://b",
+      "final_url": "",
+      "status": "等待中",
+      "title": "",
+      "risk_level": "-",
+      "result": "-",
+      "login_score": 0,
+      "login_form": false,
+      "password_field_count": 0,
+      "captcha_present": false,
+      "mfa_present": false,
+      "lockout_hint": false,
+      "default_hint": false,
+      "screenshot_path": "",
+      "error": ""
+    }
+  ]
+}
