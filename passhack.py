@@ -120,6 +120,72 @@ class AuditRecord:
     screenshot_path: str = ""
     error: str = ""
 
+class BruteForceHandler:
+    def __init__(self, session, log_queue):
+        self.session = session
+        self.log_queue = log_queue
+        # 默认中国人常用字典
+        self.default_user = ["admin", "root", "administrator", "user", "guest"]
+        self.default_pass = ["123456", "admin123", "888888", "666666", "password", "12345678"]
+
+    def run(self, record, dict_path=None):
+        if not record.login_form: return "跳过(非登录页)"
+        
+        # 加载字典
+        users, passwords = self.load_dicts(dict_path)
+        
+        # 识别字段 (从 record.field_summary 解析)
+        # 格式示例: "text:username | password:password | checkbox:remember"
+        user_key = None
+        pass_key = None
+        for field in record.field_summary.split(" | "):
+            if ":" not in field: continue
+            ftype, fname = field.split(":", 1)
+            if any(k in fname.lower() for k in ["user", "account", "name", "login"]) and not user_key:
+                user_key = fname
+            if "password" in ftype.lower() or "pass" in fname.lower():
+                pass_key = fname
+
+        if not user_key or not pass_key:
+            return "失败(未识别字段)"
+
+        # 确定请求地址
+        action_url = self.get_action_url(record)
+        
+        # 开始尝试
+        for u in users:
+            for p in passwords:
+                try:
+                    payload = {user_key: u, pass_key: p}
+                    # 模拟登录
+                    resp = self.session.post(action_url, data=payload, timeout=5, allow_redirects=False)
+                    
+                    # 判定成功：302跳转到非登录页面，或者Body包含“成功”
+                    if resp.status_code in [302, 301] and "login" not in resp.headers.get("Location", "").lower():
+                        return f"🔥 成功: {u}/{p}"
+                    if any(k in resp.text for k in ["登录成功", "success", "index.php", "welcome"]):
+                        return f"🔥 成功: {u}/{p}"
+                        
+                except Exception as e:
+                    continue
+        return "安全(未发现弱口令)"
+
+    def load_dicts(self, path):
+        # 如果有路径则读取文件，否则返回默认
+        if path and os.path.exists(path):
+            # 简单处理：假设字典是 user:pass 格式或逻辑
+            return self.default_user, self.default_pass # 实际开发中此处可扩展文件读取
+        return self.default_user, self.default_pass
+
+    def get_action_url(self, record):
+        if record.form_action and record.form_action.startswith("http"):
+            return record.form_action
+        parsed = urlparse(record.final_url or record.target)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        if record.form_action:
+            return f"{base}/{record.form_action.lstrip('/')}"
+        return record.final_url or record.target
+
 
 class SecurityAuditGUI:
     def __init__(self, root: tk.Tk):
@@ -142,7 +208,7 @@ class SecurityAuditGUI:
         self.current_project_path = None
         self.last_loaded_path = ""
         self.preview_image = None
-
+        self.brute_var = tk.BooleanVar(value=False)
         self.setup_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.check_log_queue()
@@ -151,7 +217,7 @@ class SecurityAuditGUI:
     def setup_ui(self):
         top_frame = tk.Frame(self.root, pady=10, padx=12)
         top_frame.pack(fill=tk.X)
-
+        
         tk.Label(top_frame, text="目标文件 (TXT/XLSX):").pack(side=tk.LEFT)
         self.file_entry = tk.Entry(top_frame, width=58)
         self.file_entry.pack(side=tk.LEFT, padx=6)
@@ -241,6 +307,7 @@ class SecurityAuditGUI:
         action_frame = tk.Frame(self.root, pady=4, padx=12)
         action_frame.pack(fill=tk.X)
         tk.Button(action_frame, text="工程列表", command=self.open_project_manager).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(action_frame, text="放大查看", command=self.open_preview_zoom).pack(side=tk.LEFT, padx=(0, 6))
         tk.Button(action_frame, text="查看截图", command=self.open_selected_screenshot).pack(side=tk.LEFT, padx=(0, 6))
         tk.Button(action_frame, text="打开目标", command=self.open_selected_target).pack(side=tk.LEFT, padx=(0, 6))
         tk.Button(action_frame, text="打开工程目录", command=self.open_output_dir).pack(side=tk.LEFT)
@@ -249,31 +316,45 @@ class SecurityAuditGUI:
         mid_frame = tk.Frame(self.root, padx=12)
         mid_frame.pack(fill=tk.BOTH, expand=True)
 
-        left_panel = tk.Frame(mid_frame)
-        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        split_pane = ttk.Panedwindow(mid_frame, orient=tk.HORIZONTAL)
+        split_pane.pack(fill=tk.BOTH, expand=True)
+
+        left_panel = tk.Frame(split_pane)
+        preview_frame = tk.LabelFrame(split_pane, text="详情预览", padx=10, pady=10)
+        split_pane.add(left_panel, weight=5)
+        split_pane.add(preview_frame, weight=2)
+
+        tree_frame = tk.Frame(left_panel)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
 
         columns = ("ID", "目标资产", "状态", "页面标题", "风险级别", "审计结果")
-        self.tree = ttk.Treeview(left_panel, columns=columns, show="headings", height=12)
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=12)
+        v_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        h_scroll = ttk.Scrollbar(left_panel, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+
         for name, width, anchor in [
             ("ID", 56, tk.CENTER),
-            ("目标资产", 270, tk.W),
+            ("目标资产", 280, tk.W),
             ("状态", 92, tk.CENTER),
-            ("页面标题", 250, tk.W),
+            ("页面标题", 260, tk.W),
             ("风险级别", 80, tk.CENTER),
-            ("审计结果", 420, tk.W),
+            ("审计结果", 520, tk.W),
         ]:
             self.tree.heading(name, text=name)
-            self.tree.column(name, width=width, anchor=anchor)
+            self.tree.column(name, width=width, anchor=anchor, minwidth=width)
+
         self.tree.tag_configure("risk_high", background="#ffe1e1")
         self.tree.tag_configure("risk_medium", background="#fff0cf")
         self.tree.tag_configure("risk_low", background="#edf9ed")
         self.tree.tag_configure("status_error", background="#f3d6d6")
         self.tree.bind("<Double-1>", self.on_tree_double_click)
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
-        self.tree.pack(fill=tk.BOTH, expand=True)
 
-        preview_frame = tk.LabelFrame(mid_frame, text="详情预览", padx=10, pady=10)
-        preview_frame.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(12, 0))
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+
         preview_frame.configure(width=460)
         preview_frame.pack_propagate(False)
 
@@ -312,6 +393,7 @@ class SecurityAuditGUI:
             anchor="center",
         )
         self.preview_image_label.pack(fill=tk.BOTH, pady=(0, 8))
+        self.preview_image_label.bind("<Double-1>", lambda _event: self.open_preview_zoom())
 
         tk.Label(preview_frame, text="表单与取证信息:").pack(anchor=tk.W, pady=(10, 4))
         self.preview_text = scrolledtext.ScrolledText(preview_frame, height=14, state=tk.DISABLED, wrap=tk.WORD)
@@ -917,6 +999,20 @@ a {{ color: #2563eb; text-decoration: none; }}
         self.log_queue.put(
             f"[+] {record.target} 分析完成: 标题={record.title or '无标题'} 风险={record.risk_level}"
         )
+        # --- 新增：弱口令检测环节 ---
+        if self.brute_var.get() and record.login_form:
+            self.log_queue.put(f"[*] 正在对 {record.target} 进行弱口令尝试...")
+            brute = BruteForceHandler(session, self.log_queue)
+            dict_file = self.dict_entry.get()
+            
+            res = brute.run(record, dict_path=dict_file)
+            record.result += f" | 登录探测: {res}"
+            
+            # 如果成功，强制提升风险等级
+            if "🔥" in res:
+                record.risk_level = "高"
+                self.log_queue.put(f"[!] 发现弱口令风险: {record.target} -> {res}")
+        
         return record
 
     def capture_stage(self, records: list[AuditRecord], screenshot_dir: Path):
@@ -1189,6 +1285,87 @@ a {{ color: #2563eb; text-decoration: none; }}
             messagebox.showwarning("提示", f"截图文件不存在:\n{path}")
             return
         os.startfile(path)
+
+    def open_preview_zoom(self):
+        record = self.get_selected_record_silent()
+        if not record or not record.screenshot_path:
+            messagebox.showinfo("提示", "当前记录没有可放大的截图。")
+            return
+        path = Path(record.screenshot_path)
+        if not path.exists():
+            messagebox.showwarning("提示", f"截图文件不存在:\n{path}")
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title(f"截图放大查看 - {record.title or record.target}")
+        window.geometry("1280x900")
+        window.transient(self.root)
+
+        top_bar = tk.Frame(window, pady=8, padx=12)
+        top_bar.pack(fill=tk.X)
+        tk.Label(
+            top_bar,
+            text=record.final_url or record.target,
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=1080,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(top_bar, text="打开原图", command=lambda: os.startfile(path)).pack(side=tk.RIGHT)
+
+        canvas = tk.Canvas(window, bg="#111827", highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        image = Image.open(path)
+        state = {"scale": 1.0, "photo": None, "image_id": None}
+
+        def redraw():
+            display = image.copy()
+            scaled_size = (
+                max(1, int(display.width * state["scale"])),
+                max(1, int(display.height * state["scale"])),
+            )
+            display = display.resize(scaled_size)
+            state["photo"] = ImageTk.PhotoImage(display)
+            if state["image_id"] is None:
+                state["image_id"] = canvas.create_image(20, 20, image=state["photo"], anchor="nw")
+            else:
+                canvas.itemconfig(state["image_id"], image=state["photo"])
+            canvas.coords(state["image_id"], 20, 20)
+            canvas.config(scrollregion=(0, 0, display.width + 40, display.height + 40))
+
+        def zoom(step: float):
+            state["scale"] = max(0.2, min(3.0, state["scale"] + step))
+            redraw()
+
+        control_bar = tk.Frame(window, pady=8, padx=12)
+        control_bar.pack(fill=tk.X)
+        tk.Button(control_bar, text="放大", command=lambda: zoom(0.2)).pack(side=tk.LEFT)
+        tk.Button(control_bar, text="缩小", command=lambda: zoom(-0.2)).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(control_bar, text="重置", command=lambda: reset_zoom()).pack(side=tk.LEFT, padx=(6, 0))
+
+        def reset_zoom():
+            state["scale"] = 1.0
+            redraw()
+
+        def on_mouse_wheel(event):
+            if event.delta > 0:
+                zoom(0.1)
+            elif event.delta < 0:
+                zoom(-0.1)
+
+        def start_pan(event):
+            canvas.scan_mark(event.x, event.y)
+
+        def drag_pan(event):
+            canvas.scan_dragto(event.x, event.y, gain=1)
+
+        canvas.bind("<Configure>", lambda _event: redraw())
+        canvas.bind("<MouseWheel>", on_mouse_wheel)
+        canvas.bind("<ButtonPress-1>", start_pan)
+        canvas.bind("<B1-Motion>", drag_pan)
+        window.bind("<Control-plus>", lambda _event: zoom(0.2))
+        window.bind("<Control-minus>", lambda _event: zoom(-0.2))
+        reset_zoom()
 
     def open_selected_target(self):
         record = self.get_selected_record()
