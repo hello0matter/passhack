@@ -1,0 +1,13 @@
+# 定位规则示例
+# 规则格式: scope:pattern => key=value; key=value
+# 支持 scope: host / target / url / title / default
+# 支持 key: user / pass / submit / captcha / frame
+# value 支持 css: 或 xpath: 前缀; 不写前缀时默认按 css 处理
+
+# 示例: 当前这类宅基地系统
+host:27.150.180.183 => user=css:input[placeholder*='账号'], input[placeholder*='手机号']; pass=css:input[type='password']; submit=xpath://button[contains(.,'登录')]
+# 示例: 登录框在 iframe 里
+title:登录 => frame=css:iframe; user=css:input[name='username']; pass=css:input[type='password']; submit=css:button[type='submit']
+# 兜底规则可选
+default => user=css:input[type='text']; pass=css:input[type='password']
+host:27.150.180.183:1515 => user=css:input[placeholder*='账号'], input[placeholder*='手机号'], input[name='username']; pass=css:input[type='password'], input[placeholder*='密码']; submit=xpath://button[contains(.,'登录')]; captcha=css:input[placeholder*='验证码'], input[name*='captcha']

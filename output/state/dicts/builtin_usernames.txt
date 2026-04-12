@@ -1,0 +1,16 @@
+# 内置账号字典
+# 自动生成，程序启动时会按内置默认值更新
+
+admin
+administrator
+root
+system
+sysadmin
+manager
+operator
+test
+user
+guest
+sa
+webadmin
+superadmin
