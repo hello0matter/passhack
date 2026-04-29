@@ -1,0 +1,47 @@
+[2026-04-29 15:53:38][UI] [*] 加载文件: D:/tmp/anjian/pj/st/tmp/passhack/test.txt
+[2026-04-29 15:53:38][UI] [*] 成功导入 2 个目标资产，已自动去重与协议补全。
+[2026-04-29 15:53:40][UI] [*] 初始化登录面审计引擎...
+[2026-04-29 15:53:40][UI] [*] 当前识别模式: 普通失败走大模型
+[2026-04-29 15:53:40][UI] [*] 大模型分析: 已配置 | style=OpenAI Responses API | endpoint=https://www.fhl.mom/responses | model=gpt-5.4 | timeout=20s | 截图=开
+[2026-04-29 15:53:40][UI] [*] 当前并发数: 4
+[2026-04-29 15:53:40][UI] [*] 截图策略: 发现登录框截图 | 截图节流: 0.4s
+[2026-04-29 15:53:40][UI] [*] 浏览器补扫识别: 启用 | 渲染等待: 2.5s
+[2026-04-29 15:53:40][UI] [*] 验证码OCR: 启用 | 接口: http://127.0.0.1:8888/reg
+[2026-04-29 15:53:40][UI] [*] 弱口令检测: 已启用 | 字典=默认中文常用账号/密码
+[2026-04-29 15:53:40][UI] [*] 本次将从未完成目标继续扫描，已完成记录会自动跳过。
+[2026-04-29 15:53:40][SESSION] ========================================================================
+[2026-04-29 15:53:40][SESSION] 扫描开始 | run_dir=D:\tmp\anjian\pj\st\tmp\passhack\output\20260429_155340
+[2026-04-29 15:53:40][SESSION] 源文件=D:/tmp/anjian/pj/st/tmp/passhack/test.txt
+[2026-04-29 15:53:40][SESSION] 配置 | 模式=普通失败走大模型 | 并发=4 | 浏览器补扫=启用 | 弱口令=启用 | 验证码OCR=启用
+[2026-04-29 15:53:40][TRACE][https://110.238.108.124/] 阶段切换 | stage=等待线程 | detail=已进入分析队列
+[2026-04-29 15:53:40][TRACE][https://47.113.205.23/] 阶段切换 | stage=等待线程 | detail=已进入分析队列
+[2026-04-29 15:53:40][TRACE][https://110.238.108.124/] 阶段切换 | stage=建立连接 | detail=出口=直连
+[2026-04-29 15:53:40][TRACE][https://110.238.108.124/] 阶段切换 | stage=HTTP请求 | detail=拉取首页
+[2026-04-29 15:53:40][TRACE][https://47.113.205.23/] 阶段切换 | stage=建立连接 | detail=出口=直连
+[2026-04-29 15:53:40][TRACE][https://47.113.205.23/] 阶段切换 | stage=HTTP请求 | detail=拉取首页
+[2026-04-29 15:53:40][UI] [*] 详细日志: D:\tmp\anjian\pj\st\tmp\passhack\output\state\projects\test_999c0fe9cadd.detail.log
+[2026-04-29 15:53:40][UI] [>] 正在分析: https://110.238.108.124/
+[2026-04-29 15:53:41][UI] [>] 正在分析: https://47.113.205.23/
+[2026-04-29 15:53:41][TRACE][https://47.113.205.23/] 阶段切换 | stage=静态分析 | detail=HTTP 200 | https://47.113.205.23/
+[2026-04-29 15:53:41][TRACE][https://47.113.205.23/] 静态分析 | url=https://47.113.205.23/ | title=预约按摩东郊版系统-管理后台 | score=3 | password_count=0 | field_summary=- | login_form=True | actionable=False | captcha=False | slider=False | mfa=False | lockout=False | default_hint=False
+[2026-04-29 15:53:41][TRACE][https://110.238.108.124/] 阶段切换 | stage=静态分析 | detail=HTTP 200 | https://110.238.108.124/
+[2026-04-29 15:53:41][TRACE][https://47.113.205.23/] 补扫判定 | browser_probe_needed=True | actionable=False | login_form=True | brute=on
+[2026-04-29 15:53:41][TRACE][https://47.113.205.23/] 阶段切换 | stage=浏览器补扫 | detail=CDP/浏览器渲染探测登录框
+[2026-04-29 15:53:41][TRACE][https://110.238.108.124/] 静态分析 | url=https://110.238.108.124/ | title=共享设备Saas系统-管理后台 | score=3 | password_count=0 | field_summary=- | login_form=True | actionable=False | captcha=False | slider=False | mfa=False | lockout=False | default_hint=False
+[2026-04-29 15:53:41][TRACE][https://110.238.108.124/] 补扫判定 | browser_probe_needed=True | actionable=False | login_form=True | brute=on
+[2026-04-29 15:53:41][TRACE][https://110.238.108.124/] 阶段切换 | stage=浏览器补扫 | detail=CDP/浏览器渲染探测登录框
+[2026-04-29 15:53:50][TRACE][https://47.113.205.23/] 浏览器补扫 | backend=cdp | probe_url=https://47.113.205.23/ | current_url=https://47.113.205.23/#/login | input_count=2 | field_summary=text:browser_user | password:browser_password | captcha=False | route_attempts=https://47.113.205.23/#/login
+[2026-04-29 15:53:50][TRACE][https://47.113.205.23/] 静态分析 | url=https://47.113.205.23/#/login | title=预约按摩东郊版系统-管理后台 | score=10 | password_count=1 | field_summary=text:username | password:passwd | login_form=True | actionable=True | captcha=False | slider=False | mfa=False | lockout=False | default_hint=False
+[2026-04-29 15:53:50][RESULT][https://47.113.205.23/] 最终结果 | risk=中 | result=疑似登录页 | 未见验证码 | 未见多因素认证提示 | 未见锁定策略提示 | 浏览器渲染补扫命中(CDP) | error=-
+[2026-04-29 15:53:50][TRACE][https://47.113.205.23/] 阶段切换 | stage=弱口令检测 | detail=准备提交账号/密码组合
+[2026-04-29 15:53:50][TRACE][https://110.238.108.124/] 浏览器补扫 | backend=cdp | probe_url=https://110.238.108.124/ | current_url=https://110.238.108.124/login?redirect=%2F | input_count=2 | field_summary=text:browser_user | password:browser_password | captcha=False | route_attempts=https://110.238.108.124/login?redirect=%2F
+[2026-04-29 15:53:50][TRACE][https://110.238.108.124/] 静态分析 | url=https://110.238.108.124/login?redirect=%2F | title=共享设备Saas系统-管理后台 | score=9 | password_count=1 | field_summary=text:username | password:password | login_form=True | actionable=True | captcha=False | slider=False | mfa=False | lockout=False | default_hint=False
+[2026-04-29 15:53:50][RESULT][https://110.238.108.124/] 最终结果 | risk=中 | result=疑似登录页 | 未见验证码 | 未见多因素认证提示 | 未见锁定策略提示 | 浏览器渲染补扫命中(CDP) | error=-
+[2026-04-29 15:53:50][TRACE][https://110.238.108.124/] 阶段切换 | stage=弱口令检测 | detail=准备提交账号/密码组合
+[2026-04-29 15:53:51][UI] [+] https://47.113.205.23/ 分析完成: 标题=预约按摩东郊版系统-管理后台 风险=中
+[2026-04-29 15:53:51][UI] [*] 正在对 https://47.113.205.23/ 进行弱口令尝试...
+[2026-04-29 15:53:51][UI] [+] https://110.238.108.124/ 分析完成: 标题=共享设备Saas系统-管理后台 风险=中
+[2026-04-29 15:53:51][UI] [*] 正在对 https://110.238.108.124/ 进行弱口令尝试...
+[2026-04-29 15:55:18][UI] [!] 发现弱口令风险: https://110.238.108.124/ -> 命中弱口令: admin/123456
+[2026-04-29 15:55:20][UI] [!] 发现弱口令风险: https://47.113.205.23/ -> 命中弱口令: admin/123456
+[2026-04-29 15:55:20][UI] [*] 进入截图阶段，共 2 条，截图并发 2。

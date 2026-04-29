@@ -62,6 +62,16 @@ CAPTCHA_KEYWORDS = [
     "校验码",
 ]
 
+SLIDER_CAPTCHA_KEYWORDS = [
+    "滑动验证",
+    "滑块验证",
+    "拖动滑块",
+    "向右滑动",
+    "请完成安全验证",
+    "slider",
+    "slide to",
+]
+
 MFA_KEYWORDS = [
     "otp",
     "totp",
@@ -287,6 +297,55 @@ CAPTURE_POLICY_OPTIONS = [
     CAPTURE_POLICY_ALL,
     CAPTURE_POLICY_LOGIN,
 ]
+MODE_RULE = "普通模式"
+MODE_NLP = "NLP模式"
+MODE_LLM = "大模型模式"
+MODE_RULE_LLM = "普通失败走大模型"
+MODE_NLP_LLM = "NLP失败走大模型"
+MODE_OPTIONS = [
+    MODE_RULE,
+    MODE_NLP,
+    MODE_LLM,
+    MODE_RULE_LLM,
+    MODE_NLP_LLM,
+]
+DEFAULT_ANALYSIS_MODE = MODE_RULE_LLM
+DEFAULT_LLM_TIMEOUT_SECONDS = "45"
+LLM_API_STYLE_AUTO = "自动(OpenAI兼容)"
+LLM_API_STYLE_CHAT = "OpenAI Chat Completions"
+LLM_API_STYLE_RESPONSES = "OpenAI Responses API"
+LLM_API_STYLE_OLLAMA = "Ollama Chat"
+LLM_API_STYLE_OPTIONS = [
+    LLM_API_STYLE_AUTO,
+    LLM_API_STYLE_CHAT,
+    LLM_API_STYLE_RESPONSES,
+    LLM_API_STYLE_OLLAMA,
+]
+DEFAULT_LLM_API_STYLE = LLM_API_STYLE_AUTO
+DEFAULT_LLM_PROMPT = """你是登录页面识别助手。请根据给定的 URL、标题、静态分析结果、页面可见文本和 HTML 片段，判断页面是否为登录页。
+
+只返回 JSON，不要输出额外解释。字段要求：
+{
+  "login_page": true,
+  "username_field": true,
+  "password_field": true,
+  "captcha": false,
+  "slider_captcha": false,
+  "mfa": false,
+  "lockout_hint": false,
+  "default_credential_hint": false,
+  "confidence": 0.0,
+  "summary": "一句中文结论",
+  "evidence": ["最多4条证据"]
+}
+
+规则：
+1. confidence 返回 0 到 1 的数字。
+2. 只有明确看到登录相关证据时才把 login_page 设为 true。
+3. 如果看到滑块、人机验证拖动条、安全验证弹窗，slider_captcha 设为 true。
+4. summary 控制在 30 字以内。
+5. 如果同时提供了页面截图，请结合截图一起判断。
+"""
 
 
 def compact_exception_message(exc: Exception) -> str:
@@ -360,6 +419,7 @@ class AuditRecord:
     login_form: bool = False
     password_field_count: int = 0
     captcha_present: bool = False
+    slider_captcha_present: bool = False
     mfa_present: bool = False
     lockout_hint: bool = False
     default_hint: bool = False
@@ -368,6 +428,16 @@ class AuditRecord:
     field_summary: str = ""
     screenshot_path: str = ""
     error: str = ""
+    analysis_stage: str = ""
+    analysis_detail: str = ""
+    analysis_started_ts: float = 0.0
+    analysis_stage_ts: float = 0.0
+    analysis_last_ui_ts: float = 0.0
+    analysis_warned_stage: str = ""
+    llm_decision: str = ""
+    llm_summary: str = ""
+    llm_confidence: float = 0.0
+    llm_evidence: str = ""
 
 class BruteForceHandler:
     def __init__(
@@ -406,6 +476,8 @@ class BruteForceHandler:
             return "跳过(非登录页)"
         if not self.has_actionable_login_fields(record):
             return "跳过(未识别到可用登录框)"
+        if getattr(record, "slider_captcha_present", False):
+            return "跳过(检测到滑块验证码，当前版本不支持自动完成)"
 
         try:
             users, passwords, dict_label = self.load_dicts(dict_mode, user_dict_path, pass_dict_path)
@@ -1237,6 +1309,7 @@ class SecurityAuditGUI:
         self.source_watch_signature = None
         self.source_change_prompt_active = False
         self.source_change_pending = False
+        self.llm_last_error = ""
         self.last_loaded_path = ""
         self.preview_image = None
         self.brute_var = tk.BooleanVar(value=False)
@@ -1500,7 +1573,7 @@ class SecurityAuditGUI:
                     if self.is_scanning:
                         if not self.source_change_pending:
                             self.source_change_pending = True
-                            self.log_message(f"[~] 检测到源文件变化，当前正在扫描，停止后会提示刷新: {filepath}")
+                        self.log_message(f"[~] 检测到源文件变化，当前正在扫描，停止后会提示刷新: {filepath}")
                     else:
                         self.source_change_pending = True
 
@@ -1509,12 +1582,459 @@ class SecurityAuditGUI:
         finally:
             self.root.after(self.source_watch_interval_ms, self.watch_source_file_changes)
 
+    def get_llm_timeout_seconds(self) -> float:
+        try:
+            return max(5.0, min(120.0, float(self.llm_timeout_var.get().strip() or DEFAULT_LLM_TIMEOUT_SECONDS)))
+        except Exception:
+            return float(DEFAULT_LLM_TIMEOUT_SECONDS)
+
+    def get_llm_root_url(self) -> str:
+        value = self.llm_base_url_entry.get().strip().rstrip("/")
+        if not value:
+            return ""
+        for suffix in ("/chat/completions", "/responses", "/api/chat"):
+            if value.endswith(suffix):
+                return value[: -len(suffix)]
+        return value
+
+    def get_llm_api_style(self) -> str:
+        value = (self.llm_api_style_var.get() or "").strip()
+        return value if value in LLM_API_STYLE_OPTIONS else DEFAULT_LLM_API_STYLE
+
+    def get_llm_candidate_specs(self) -> list[tuple[str, str]]:
+        raw = self.llm_base_url_entry.get().strip().rstrip("/")
+        if not raw:
+            return []
+        style = self.get_llm_api_style()
+        root = self.get_llm_root_url()
+        if style == LLM_API_STYLE_CHAT:
+            return [(LLM_API_STYLE_CHAT, raw if raw.endswith("/chat/completions") else root + "/chat/completions")]
+        if style == LLM_API_STYLE_RESPONSES:
+            return [(LLM_API_STYLE_RESPONSES, raw if raw.endswith("/responses") else root + "/responses")]
+        if style == LLM_API_STYLE_OLLAMA:
+            return [(LLM_API_STYLE_OLLAMA, raw if raw.endswith("/api/chat") else root + "/api/chat")]
+        if raw.endswith("/api/chat"):
+            return [(LLM_API_STYLE_OLLAMA, raw)]
+        if raw.endswith("/responses"):
+            return [(LLM_API_STYLE_RESPONSES, raw), (LLM_API_STYLE_CHAT, root + "/chat/completions")]
+        if raw.endswith("/chat/completions"):
+            return [(LLM_API_STYLE_CHAT, raw), (LLM_API_STYLE_RESPONSES, root + "/responses")]
+        return [
+            (LLM_API_STYLE_RESPONSES, root + "/responses"),
+            (LLM_API_STYLE_CHAT, root + "/chat/completions"),
+        ]
+
+    def get_llm_endpoint(self) -> str:
+        specs = self.get_llm_candidate_specs()
+        return specs[0][1] if specs else ""
+
+    def get_llm_prompt(self) -> str:
+        text = self.llm_prompt_text.get("1.0", tk.END).strip()
+        return text or DEFAULT_LLM_PROMPT
+
+    def restore_default_llm_prompt(self):
+        self.llm_prompt_text.delete("1.0", tk.END)
+        self.llm_prompt_text.insert("1.0", DEFAULT_LLM_PROMPT)
+
+    def is_llm_configured(self) -> bool:
+        return bool(self.get_llm_endpoint() and self.llm_model_entry.get().strip())
+
+    def build_llm_headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        api_key = self.llm_api_key_entry.get().strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    def extract_llm_content(self, data: dict, api_style: str) -> str:
+        if api_style == LLM_API_STYLE_OLLAMA:
+            message = data.get("message") or {}
+            content = message.get("content") or ""
+            return str(content or "")
+        if api_style == LLM_API_STYLE_RESPONSES:
+            if isinstance(data.get("output_text"), str):
+                return data.get("output_text") or ""
+            outputs = data.get("output") or []
+            parts = []
+            for item in outputs:
+                for content in item.get("content") or []:
+                    text_value = content.get("text")
+                    if isinstance(text_value, str):
+                        parts.append(text_value)
+            if parts:
+                return "\n".join(parts)
+        content = ""
+        choices = data.get("choices") or []
+        if choices:
+            message = choices[0].get("message") or {}
+            content = message.get("content") or ""
+            if isinstance(content, list):
+                content = "".join(
+                    str(item.get("text", "")) if isinstance(item, dict) else str(item)
+                    for item in content
+                )
+        if not content and isinstance(data.get("output_text"), str):
+            content = data.get("output_text") or ""
+        return content
+
+    def build_llm_request_payload(
+        self,
+        api_style: str,
+        model: str,
+        system_prompt: str,
+        user_text: str,
+        max_tokens: int,
+        temperature: float,
+        image_data_url: str = "",
+        image_base64: str = "",
+    ) -> dict:
+        if api_style == LLM_API_STYLE_RESPONSES:
+            user_content = [{"type": "input_text", "text": user_text}]
+            if image_data_url:
+                user_content.append({"type": "input_image", "image_url": image_data_url})
+            return {
+                "model": model,
+                "temperature": temperature,
+                "max_output_tokens": max_tokens,
+                "input": [
+                    {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                    {"role": "user", "content": user_content},
+                ],
+            }
+        if api_style == LLM_API_STYLE_OLLAMA:
+            user_message = {"role": "user", "content": user_text}
+            if image_base64:
+                user_message["images"] = [image_base64]
+            return {
+                "model": model,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    user_message,
+                ],
+                "options": {
+                    "temperature": temperature,
+                },
+            }
+        user_content = user_text
+        if image_data_url:
+            user_content = [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+            ]
+        return {
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+        }
+
+    def send_llm_payload(
+        self,
+        system_prompt: str,
+        user_text: str,
+        max_tokens: int,
+        temperature: float,
+        image_data_url: str = "",
+        image_base64: str = "",
+    ) -> tuple[dict, str, str, str]:
+        last_exc = None
+        for api_style, endpoint in self.get_llm_candidate_specs():
+            payload = self.build_llm_request_payload(
+                api_style,
+                self.llm_model_entry.get().strip(),
+                system_prompt,
+                user_text,
+                max_tokens,
+                temperature,
+                image_data_url=image_data_url,
+                image_base64=image_base64,
+            )
+            try:
+                response = requests.post(
+                    endpoint,
+                    headers=self.build_llm_headers(),
+                    json=payload,
+                    timeout=self.get_llm_timeout_seconds(),
+                    verify=False,
+                )
+                response.raise_for_status()
+                data = response.json()
+                content = self.extract_llm_content(data, api_style)
+                return data, content, api_style, endpoint
+            except Exception as exc:
+                last_exc = exc
+                if self.get_llm_api_style() != LLM_API_STYLE_AUTO:
+                    break
+        raise last_exc or RuntimeError("未获取到有效大模型响应")
+
+    def test_llm_connection(self):
+        endpoint = self.get_llm_endpoint()
+        model = self.llm_model_entry.get().strip()
+        if not endpoint or not model:
+            messagebox.showwarning("提示", "请先填写大模型接口URL和模型名。")
+            return
+
+        self.log_message(f"[*] 正在测试大模型连通性: style={self.get_llm_api_style()} | endpoint={endpoint} | model={model}")
+
+        def worker():
+            try:
+                _data, content, api_style, resolved_endpoint = self.send_llm_payload(
+                    "你是连通性测试助手，只回复 OK。",
+                    "请只回复OK",
+                    max_tokens=16,
+                    temperature=0.0,
+                )
+                content = content.strip() or "(空响应)"
+
+                def on_success():
+                    self.log_message(f"[*] 大模型连通测试成功: style={api_style} | endpoint={resolved_endpoint} | content={content}")
+                    messagebox.showinfo("大模型测试", f"连通成功。\n\n接口格式: {api_style}\n接口地址: {resolved_endpoint}\n返回内容:\n{content}")
+
+                self.root.after(0, on_success)
+            except Exception as exc:
+                error_text = compact_exception_message(exc)
+
+                def on_error():
+                    self.log_message(f"[~] 大模型连通测试失败: {error_text}")
+                    messagebox.showerror("大模型测试", f"连通失败:\n{error_text}")
+
+                self.root.after(0, on_error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def capture_temp_screenshot_for_llm(self, url: str, proxy_addr: str | None = None) -> Path | None:
+        temp_dir = self.output_dir / "llm_temp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        filename = temp_dir / f"llm_{int(time.time() * 1000)}_{threading.get_ident()}.png"
+        cli_capture = self.capture_screenshot_with_browser_cli(url, filename, proxy_addr)
+        if cli_capture:
+            return cli_capture
+        driver = self.init_headless_driver(proxy_addr)
+        if not driver:
+            return None
+        try:
+            driver.get(url)
+            self.dismiss_browser_certificate_warning(driver)
+            self.wait_for_browser_render(driver)
+            self.dismiss_browser_obstructions(driver)
+            driver.save_screenshot(str(filename))
+            return filename if filename.exists() and filename.stat().st_size > 0 else None
+        except Exception:
+            return None
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    def build_llm_image_payload(self, image_path: Path | None) -> dict | None:
+        if image_path is None or not image_path.exists():
+            return None
+        try:
+            with Image.open(image_path) as image:
+                image.thumbnail((1600, 1600))
+                buffer = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+                buffer.close()
+                temp_png = Path(buffer.name)
+                image.save(temp_png, format="PNG")
+            data = temp_png.read_bytes()
+            temp_png.unlink(missing_ok=True)
+            encoded = base64.b64encode(data).decode("ascii")
+            return {
+                "data_url": f"data:image/png;base64,{encoded}",
+                "base64": encoded,
+            }
+        except Exception:
+            return None
+
+    def should_fallback_to_llm(self, record: AuditRecord) -> bool:
+        result_text = record.result or ""
+        return bool(
+            not record.login_form
+            or not self.is_actionable_login_record(record)
+            or record.slider_captcha_present
+            or "未识别到登录相关特征" in result_text
+            or "浏览器渲染补扫未命中" in result_text
+            or "浏览器补扫失败" in result_text
+        )
+
+    def extract_json_object_from_text(self, text: str) -> dict | None:
+        payload_text = (text or "").strip()
+        if not payload_text:
+            return None
+        try:
+            return json.loads(payload_text)
+        except Exception:
+            pass
+        match = re.search(r"\{[\s\S]*\}", payload_text)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return None
+
+    def call_llm_for_page(self, record: AuditRecord, page_url: str, html_text: str) -> dict | None:
+        endpoint = self.get_llm_endpoint()
+        model = self.llm_model_entry.get().strip()
+        if not endpoint or not model:
+            self.llm_last_error = "未配置大模型 URL 或模型名"
+            return None
+
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        visible_text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))[:5000]
+        html_excerpt = (html_text or "")[:8000]
+        user_payload_text = json.dumps(
+            {
+                "url": page_url,
+                "title": record.title,
+                "static_result": record.result,
+                "field_summary": record.field_summary,
+                "visible_text": visible_text,
+                "html_excerpt": html_excerpt,
+            },
+            ensure_ascii=False,
+        )
+        temp_image_path = None
+        image_data_url = ""
+        image_base64 = ""
+        if self.llm_include_screenshot_var.get():
+            temp_image_path = self.capture_temp_screenshot_for_llm(page_url, record.proxy_used or None)
+            image_payload = self.build_llm_image_payload(temp_image_path)
+            if image_payload is not None:
+                image_data_url = image_payload.get("data_url", "")
+                image_base64 = image_payload.get("base64", "")
+                self.log_record_trace(record, "大模型输入 | mode=text+image")
+            else:
+                self.log_record_trace(record, "大模型输入 | mode=text-only | reason=未获取到有效截图", level="WARN")
+        else:
+            self.log_record_trace(record, "大模型输入 | mode=text-only | reason=已关闭截图上传")
+        try:
+            data, content, api_style, resolved_endpoint = self.send_llm_payload(
+                self.get_llm_prompt(),
+                user_payload_text,
+                max_tokens=600,
+                temperature=0.1,
+                image_data_url=image_data_url,
+                image_base64=image_base64,
+            )
+            self.log_record_trace(record, f"大模型请求成功 | style={api_style} | endpoint={resolved_endpoint}")
+            parsed = self.extract_json_object_from_text(content)
+            if parsed is None:
+                self.llm_last_error = f"大模型返回内容无法解析: {content[:200]}"
+            else:
+                self.llm_last_error = ""
+            return parsed
+        except Exception as exc:
+            self.llm_last_error = compact_exception_message(exc)
+            return None
+        finally:
+            if temp_image_path is not None:
+                temp_image_path.unlink(missing_ok=True)
+
+    def apply_llm_analysis_result(self, record: AuditRecord, llm_result: dict | None):
+        if not isinstance(llm_result, dict):
+            return False
+
+        def to_bool(key: str) -> bool:
+            return bool(llm_result.get(key, False))
+
+        login_page = to_bool("login_page")
+        username_field = to_bool("username_field")
+        password_field = to_bool("password_field")
+        captcha = to_bool("captcha")
+        slider = to_bool("slider_captcha")
+        mfa = to_bool("mfa")
+        lockout = to_bool("lockout_hint")
+        default_hint = to_bool("default_credential_hint")
+        confidence = llm_result.get("confidence", 0)
+        try:
+            confidence_value = float(confidence)
+        except Exception:
+            confidence_value = 0.0
+        summary = str(llm_result.get("summary", "") or "").strip()
+        evidence = llm_result.get("evidence") or []
+        evidence_items = [str(item).strip() for item in evidence if str(item).strip()][:4]
+
+        changed = False
+        if login_page:
+            record.login_form = True
+            changed = True
+        if password_field:
+            record.password_field_count = max(1, record.password_field_count)
+            changed = True
+        if username_field or password_field:
+            hints = []
+            if username_field:
+                hints.append("text:llm_user")
+            if password_field:
+                hints.append("password:llm_password")
+            if hints and not record.field_summary:
+                record.field_summary = " | ".join(hints)
+            changed = True
+        if captcha:
+            record.captcha_present = True
+            changed = True
+        if slider:
+            record.slider_captcha_present = True
+            record.captcha_present = True
+            changed = True
+        if mfa:
+            record.mfa_present = True
+            changed = True
+        if lockout:
+            record.lockout_hint = True
+            changed = True
+        if default_hint:
+            record.default_hint = True
+            changed = True
+
+        record.llm_decision = "大模型修正命中" if changed else "大模型未修正"
+        record.llm_summary = summary[:120]
+        record.llm_confidence = confidence_value
+        record.llm_evidence = " | ".join(evidence_items[:4])
+        llm_label = "大模型识别命中" if changed else "大模型识别未命中"
+        detail_parts = []
+        if summary:
+            detail_parts.append(summary[:80])
+        if evidence_items:
+            detail_parts.append("；".join(evidence_items)[:180])
+        detail_parts.append(f"置信度={confidence_value:.2f}")
+        record.result = f"{record.result} | {llm_label} | {' | '.join([part for part in detail_parts if part])}".strip(" |")
+        record.risk_level = self.calculate_risk(record)
+        return changed
+
     def build_browser_env(self) -> dict:
         env = os.environ.copy()
         for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"):
             env.pop(key, None)
         env["CHROME_LOG_FILE"] = os.devnull
         return env
+
+    def normalize_analysis_mode(self, value: str) -> str:
+        mapping = {
+            "规则模式": MODE_RULE,
+            "NLP模式": MODE_NLP,
+            MODE_RULE: MODE_RULE,
+            MODE_NLP: MODE_NLP,
+            MODE_LLM: MODE_LLM,
+            MODE_RULE_LLM: MODE_RULE_LLM,
+            MODE_NLP_LLM: MODE_NLP_LLM,
+        }
+        return mapping.get((value or "").strip(), DEFAULT_ANALYSIS_MODE)
+
+    def uses_nlp_weighting(self) -> bool:
+        return self.normalize_analysis_mode(self.mode_var.get()) in {MODE_NLP, MODE_NLP_LLM}
+
+    def uses_llm_primary(self) -> bool:
+        return self.normalize_analysis_mode(self.mode_var.get()) == MODE_LLM
+
+    def uses_llm_fallback(self) -> bool:
+        return self.normalize_analysis_mode(self.mode_var.get()) in {MODE_RULE_LLM, MODE_NLP_LLM}
 
     def browser_probe_has_login_signal(self, probe: dict | None) -> bool:
         if not isinstance(probe, dict):
@@ -1750,6 +2270,65 @@ class SecurityAuditGUI:
             shutil.rmtree(user_data_dir, ignore_errors=True)
             return None
 
+    def dismiss_browser_certificate_warning(self, driver) -> bool:
+        try:
+            current_url = (driver.current_url or "").lower()
+        except Exception:
+            current_url = ""
+        try:
+            page_source = (driver.page_source or "").lower()
+        except Exception:
+            page_source = ""
+
+        certificate_markers = [
+            "privacy error",
+            "your connection is not private",
+            "您的连接不是私密连接",
+            "连接不是私密连接",
+            "net::err_cert",
+            "证书",
+        ]
+        if not (
+            current_url.startswith("chrome-error://")
+            or current_url.startswith("edge-error://")
+            or any(marker in page_source for marker in certificate_markers)
+        ):
+            return False
+
+        try:
+            driver.execute_script(
+                """
+                const details = document.getElementById('details-button');
+                if (details) details.click();
+                const proceed = document.getElementById('proceed-link');
+                if (proceed) proceed.click();
+                """
+            )
+        except Exception:
+            pass
+
+        try:
+            from selenium.webdriver.common.by import By
+            from selenium.webdriver.common.keys import Keys
+            body = driver.find_element(By.TAG_NAME, "body")
+            body.send_keys("thisisunsafe")
+            body.send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+
+        time.sleep(1.0)
+        try:
+            new_url = (driver.current_url or "").lower()
+            if not (new_url.startswith("chrome-error://") or new_url.startswith("edge-error://")):
+                return True
+        except Exception:
+            pass
+        try:
+            page_source = (driver.page_source or "").lower()
+            return not any(marker in page_source for marker in certificate_markers)
+        except Exception:
+            return False
+
     def close_devtools_browser(self, context: dict | None):
         if not context:
             return
@@ -1813,6 +2392,11 @@ class SecurityAuditGUI:
 
             wait_response(send("Page.enable"))
             wait_response(send("Runtime.enable"))
+            try:
+                wait_response(send("Security.enable"))
+                wait_response(send("Security.setIgnoreCertificateErrors", {"ignore": True}))
+            except Exception:
+                pass
             script = """
 JSON.stringify((() => {
   const MAX_DEPTH = 3;
@@ -1876,63 +2460,71 @@ JSON.stringify((() => {
 
             def collect_probe(navigate_url: str) -> dict | None:
                 wait_response(send("Page.navigate", {"url": navigate_url}), 20.0)
-                time.sleep(max(1.0, self.get_render_wait()))
-                response = wait_response(send("Runtime.evaluate", {"expression": script, "returnByValue": True}), 20.0)
-                raw_value = response.get("result", {}).get("result", {}).get("value", "")
-                if not raw_value:
-                    return None
-                payload = json.loads(raw_value)
-                inputs = payload.get("inputs") or []
-                hints = []
-                user_found = False
-                pass_found = False
-                captcha_found = False
-                for item in inputs:
-                    merged = " ".join(
-                        [
-                            item.get("name", ""),
-                            item.get("id", ""),
-                            item.get("placeholder", ""),
-                            item.get("aria", ""),
-                            item.get("autocomplete", ""),
-                            item.get("cls", ""),
-                            item.get("title", ""),
-                            item.get("label", ""),
-                            item.get("nearby", ""),
-                        ]
-                    ).lower()
-                    field_type = (item.get("type") or "").lower()
-                    if not pass_found and ("password" in field_type or any(keyword in merged for keyword in PASSWORD_FIELD_KEYWORDS)):
-                        pass_found = True
-                        hints.append("password:browser_password")
-                        continue
-                    if not captcha_found and any(keyword in merged for keyword in CAPTCHA_FIELD_KEYWORDS):
-                        captcha_found = True
-                        hints.append("text:browser_captcha")
-                        continue
-                    if field_type in {"hidden", "submit", "button", "checkbox", "radio", "file"}:
-                        continue
-                    if any(keyword in merged for keyword in SKIP_USERNAME_FIELD_KEYWORDS):
-                        continue
-                    if not user_found and (
-                        any(keyword in merged for keyword in USER_FIELD_KEYWORDS)
-                        or field_type in {"", "text", "email", "tel", "number", "search"}
-                    ):
-                        user_found = True
-                        hints.append("text:browser_user")
+                deadline = time.time() + max(1.0, self.get_render_wait())
+                best_probe = None
+                while True:
+                    response = wait_response(send("Runtime.evaluate", {"expression": script, "returnByValue": True}), 20.0)
+                    raw_value = response.get("result", {}).get("result", {}).get("value", "")
+                    if raw_value:
+                        payload = json.loads(raw_value)
+                        inputs = payload.get("inputs") or []
+                        hints = []
+                        user_found = False
+                        pass_found = False
+                        captcha_found = False
+                        for item in inputs:
+                            merged = " ".join(
+                                [
+                                    item.get("name", ""),
+                                    item.get("id", ""),
+                                    item.get("placeholder", ""),
+                                    item.get("aria", ""),
+                                    item.get("autocomplete", ""),
+                                    item.get("cls", ""),
+                                    item.get("title", ""),
+                                    item.get("label", ""),
+                                    item.get("nearby", ""),
+                                ]
+                            ).lower()
+                            field_type = (item.get("type") or "").lower()
+                            if not pass_found and ("password" in field_type or any(keyword in merged for keyword in PASSWORD_FIELD_KEYWORDS)):
+                                pass_found = True
+                                hints.append("password:browser_password")
+                                continue
+                            if not captcha_found and any(keyword in merged for keyword in CAPTCHA_FIELD_KEYWORDS):
+                                captcha_found = True
+                                hints.append("text:browser_captcha")
+                                continue
+                            if field_type in {"hidden", "submit", "button", "checkbox", "radio", "file"}:
+                                continue
+                            if any(keyword in merged for keyword in SKIP_USERNAME_FIELD_KEYWORDS):
+                                continue
+                            if not user_found and (
+                                any(keyword in merged for keyword in USER_FIELD_KEYWORDS)
+                                or field_type in {"", "text", "email", "tel", "number", "search"}
+                            ):
+                                user_found = True
+                                hints.append("text:browser_user")
 
-                return {
-                    "current_url": payload.get("current_url") or navigate_url,
-                    "html": payload.get("html") or "",
-                    "title": payload.get("title") or "",
-                    "login_form": bool(pass_found),
-                    "captcha_present": bool(captcha_found),
-                    "field_summary": " | ".join(hints),
-                    "form_method": "POST",
-                    "probe_backend": "cdp",
-                    "probe_url": navigate_url,
-                    "input_count": len(inputs),
-                }
+                        current_probe = {
+                            "current_url": payload.get("current_url") or navigate_url,
+                            "html": payload.get("html") or "",
+                            "title": payload.get("title") or "",
+                            "login_form": bool(pass_found),
+                            "captcha_present": bool(captcha_found),
+                            "field_summary": " | ".join(hints),
+                            "form_method": "POST",
+                            "probe_backend": "cdp",
+                            "probe_url": navigate_url,
+                            "input_count": len(inputs),
+                        }
+                        if best_probe is None or self.rank_browser_probe(current_probe) >= self.rank_browser_probe(best_probe):
+                            best_probe = current_probe
+                        if self.browser_probe_has_login_signal(current_probe):
+                            return current_probe
+                    if time.time() >= deadline:
+                        return best_probe
+                    time.sleep(0.5)
 
             base_probe = collect_probe(url)
             if not base_probe:
@@ -2011,8 +2603,7 @@ JSON.stringify((() => {
         self.file_entry = self.make_entry(task_frame, width=60)
         self.file_entry.grid(row=0, column=1, sticky="ew", padx=(6, 6), pady=(0, 8))
         self.make_button(task_frame, text="浏览...", command=self.load_file).grid(row=0, column=2, padx=(0, 6), pady=(0, 8))
-        self.make_button(task_frame, text="刷新源文件", command=self.reload_current_source_file).grid(row=0, column=3, padx=(0, 6), pady=(0, 8))
-        self.make_button(task_frame, text="导出结果", command=self.save_results).grid(row=0, column=4, pady=(0, 8))
+        self.make_button(task_frame, text="导出结果", command=self.save_results).grid(row=0, column=3, pady=(0, 8))
 
         self.summary_var = tk.StringVar(value="摘要: 总计 0 | 已完成 0 | 待处理 0 | 高 0 | 中 0 | 低 0 | 有截图 0")
         self.make_label(
@@ -2039,11 +2630,13 @@ JSON.stringify((() => {
         scan_tab = tk.Frame(config_notebook, bg=self.palette["bg"])
         brute_tab = tk.Frame(config_notebook, bg=self.palette["bg"])
         render_tab = tk.Frame(config_notebook, bg=self.palette["bg"])
+        llm_tab = tk.Frame(config_notebook, bg=self.palette["bg"])
         quick_tab = tk.Frame(config_notebook, bg=self.palette["bg"])
         log_tab = tk.Frame(config_notebook, bg=self.palette["bg"])
         config_notebook.add(scan_tab, text="扫描配置")
         config_notebook.add(brute_tab, text="弱口令检测")
         config_notebook.add(render_tab, text="浏览器 / OCR / 规则")
+        config_notebook.add(llm_tab, text="大模型")
         config_notebook.add(quick_tab, text="快捷操作")
         config_notebook.add(log_tab, text="运行日志")
 
@@ -2105,14 +2698,14 @@ JSON.stringify((() => {
         self.proxy_cooldown_box.grid(row=0, column=5, sticky="w", padx=(4, 12))
 
         self.make_label(scan_row, text="识别模式:").grid(row=0, column=6, sticky="w")
-        self.mode_var = tk.StringVar(value="规则模式")
-        ttk.Combobox(scan_row, textvariable=self.mode_var, values=["规则模式", "NLP模式"], width=12, state="readonly").grid(row=0, column=7, sticky="w", padx=(4, 12))
+        self.mode_var = tk.StringVar(value=DEFAULT_ANALYSIS_MODE)
+        ttk.Combobox(scan_row, textvariable=self.mode_var, values=MODE_OPTIONS, width=16, state="readonly").grid(row=0, column=7, sticky="w", padx=(4, 12))
 
         self.capture_var = tk.BooleanVar(value=True)
         self.make_checkbutton(scan_row, text="尝试截图", variable=self.capture_var).grid(row=0, column=8, sticky="w", padx=(0, 12))
 
         self.make_label(scan_row, text="截图策略:").grid(row=0, column=9, sticky="w")
-        self.capture_policy_var = tk.StringVar(value=CAPTURE_POLICY_HIT)
+        self.capture_policy_var = tk.StringVar(value=CAPTURE_POLICY_LOGIN)
         ttk.Combobox(
             scan_row,
             textvariable=self.capture_policy_var,
@@ -2254,6 +2847,51 @@ JSON.stringify((() => {
             wraplength=1280,
         ).pack(fill=tk.X, pady=(8, 0))
 
+        llm_frame = self.make_section(llm_tab, "大模型分析")
+        llm_frame.pack(fill=tk.BOTH, expand=True, pady=8)
+
+        llm_row1 = tk.Frame(llm_frame, bg=llm_frame.cget("bg"))
+        llm_row1.pack(fill=tk.X)
+        llm_row1.columnconfigure(1, weight=1)
+        llm_row1.columnconfigure(3, weight=1)
+        llm_row1.columnconfigure(5, weight=1)
+        llm_row1.columnconfigure(7, weight=1)
+
+        self.make_label(llm_row1, text="接口格式:").grid(row=0, column=0, sticky="w")
+        self.llm_api_style_var = tk.StringVar(value=DEFAULT_LLM_API_STYLE)
+        ttk.Combobox(llm_row1, textvariable=self.llm_api_style_var, values=LLM_API_STYLE_OPTIONS, width=20, state="readonly").grid(row=0, column=1, sticky="w", padx=(4, 12))
+        self.make_label(llm_row1, text="接口URL:").grid(row=0, column=2, sticky="w")
+        self.llm_base_url_entry = self.make_entry(llm_row1, width=28)
+        self.llm_base_url_entry.grid(row=0, column=3, sticky="ew", padx=(4, 12))
+        self.make_label(llm_row1, text="模型名:").grid(row=0, column=4, sticky="w")
+        self.llm_model_entry = self.make_entry(llm_row1, width=18)
+        self.llm_model_entry.grid(row=0, column=5, sticky="ew", padx=(4, 12))
+        self.make_label(llm_row1, text="超时:").grid(row=0, column=6, sticky="w")
+        self.llm_timeout_var = tk.StringVar(value=DEFAULT_LLM_TIMEOUT_SECONDS)
+        ttk.Combobox(llm_row1, textvariable=self.llm_timeout_var, values=["10", "15", "20", "30", "45", "60"], width=5, state="readonly").grid(row=0, column=7, sticky="w", padx=(4, 0))
+
+        llm_row2 = tk.Frame(llm_frame, bg=llm_frame.cget("bg"))
+        llm_row2.pack(fill=tk.X, pady=(8, 0))
+        llm_row2.columnconfigure(1, weight=1)
+
+        self.make_label(llm_row2, text="API Key:").grid(row=0, column=0, sticky="w")
+        self.llm_api_key_entry = self.make_entry(llm_row2, width=54, show="*")
+        self.llm_api_key_entry.grid(row=0, column=1, sticky="ew", padx=(4, 12))
+        self.llm_include_screenshot_var = tk.BooleanVar(value=True)
+        self.make_checkbutton(llm_row2, text="附带页面截图", variable=self.llm_include_screenshot_var).grid(row=0, column=2, sticky="w", padx=(0, 12))
+        self.make_button(llm_row2, text="测试连通", command=self.test_llm_connection, tone="success").grid(row=0, column=3, sticky="e", padx=(0, 8))
+        self.make_button(llm_row2, text="恢复默认Prompt", command=self.restore_default_llm_prompt).grid(row=0, column=4, sticky="e")
+
+        llm_row3 = tk.Frame(llm_frame, bg=llm_frame.cget("bg"))
+        llm_row3.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        llm_row3.columnconfigure(0, weight=1)
+        llm_row3.rowconfigure(1, weight=1)
+
+        self.make_label(llm_row3, text="Prompt模板(OpenAI兼容 Chat Completions):").grid(row=0, column=0, sticky="w")
+        self.llm_prompt_text = scrolledtext.ScrolledText(llm_row3, height=5, wrap=tk.WORD, font=self.font_normal)
+        self.llm_prompt_text.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+        self.llm_prompt_text.insert("1.0", DEFAULT_LLM_PROMPT)
+
         action_frame = self.make_section(quick_tab, "快捷操作")
         action_frame.pack(fill=tk.X, pady=8)
         action_buttons = [
@@ -2334,7 +2972,7 @@ JSON.stringify((() => {
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
 
-        columns = ("ID", "目标资产", "状态", "页面标题", "风险级别", "审计结果")
+        columns = ("ID", "目标资产", "状态", "页面标题", "风险级别", "大模型结论", "审计结果")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=12)
         v_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         h_scroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
@@ -2344,9 +2982,10 @@ JSON.stringify((() => {
             ("ID", 56, tk.CENTER),
             ("目标资产", 280, tk.W),
             ("状态", 92, tk.CENTER),
-            ("页面标题", 260, tk.W),
+            ("页面标题", 220, tk.W),
             ("风险级别", 80, tk.CENTER),
-            ("审计结果", 720, tk.W),
+            ("大模型结论", 240, tk.W),
+            ("审计结果", 560, tk.W),
         ])
 
         self.tree.tag_configure("risk_high", background="#ffe1e1", foreground=self.palette["text"])
@@ -3253,6 +3892,7 @@ JSON.stringify((() => {
                     record.status,
                     record.title or "-",
                     record.risk_level,
+                    self.get_llm_summary_display(record),
                     record.result,
                 ),
                 tags=(self.tag_for_record(record),),
@@ -3325,6 +3965,10 @@ JSON.stringify((() => {
                     "状态",
                     "页面标题",
                     "风险级别",
+                    "大模型结论",
+                    "大模型摘要",
+                    "大模型置信度",
+                    "大模型证据",
                     "登录评分",
                     "审计结果",
                     "是否疑似登录页",
@@ -3352,6 +3996,10 @@ JSON.stringify((() => {
                         record.status,
                         record.title,
                         record.risk_level,
+                        record.llm_decision,
+                        record.llm_summary,
+                        record.llm_confidence,
+                        record.llm_evidence,
                         record.login_score,
                         record.result,
                         "是" if record.login_form else "否",
@@ -3393,6 +4041,10 @@ JSON.stringify((() => {
                 f"<td>{html.escape(record.status)}</td>"
                 f"<td>{html.escape(record.title or '-')}</td>"
                 f"<td>{html.escape(record.risk_level)}</td>"
+                f"<td>{html.escape(record.llm_decision or '-')}</td>"
+                f"<td>{html.escape(record.llm_summary or '-')}</td>"
+                f"<td>{html.escape(f'{record.llm_confidence:.2f}' if record.llm_decision else '-')}</td>"
+                f"<td>{html.escape(record.llm_evidence or '-')}</td>"
                 f"<td>{record.login_score}</td>"
                 f"<td>{html.escape(record.result)}</td>"
                 f"<td>{html.escape(record.proxy_used or '-')}</td>"
@@ -3457,7 +4109,7 @@ img {{ max-width: 280px; max-height: 180px; border: 1px solid #b8c4d2; border-ra
 <section class="profile-grid">{''.join(profile_sections)}</section>
 <table>
 <thead>
-<tr><th>ID</th><th>目标资产</th><th>状态</th><th>页面标题</th><th>风险级别</th><th>登录评分</th><th>审计结果</th><th>代理出口</th><th>OCR接口</th><th>OCR规则</th><th>表单方法</th><th>字段摘要</th><th>截图</th></tr>
+<tr><th>ID</th><th>目标资产</th><th>状态</th><th>页面标题</th><th>风险级别</th><th>大模型结论</th><th>大模型摘要</th><th>大模型置信度</th><th>大模型证据</th><th>登录评分</th><th>审计结果</th><th>代理出口</th><th>OCR接口</th><th>OCR规则</th><th>表单方法</th><th>字段摘要</th><th>截图</th></tr>
 </thead>
 <tbody>
 {''.join(rows)}
@@ -3548,6 +4200,8 @@ a {{ color: #2563eb; text-decoration: none; }}
                 tags.append("验证码登录页")
             else:
                 tags.append("无验证码登录页")
+            if record.slider_captcha_present:
+                tags.append("滑块验证码")
             if record.mfa_present:
                 tags.append("多因素登录页")
             if record.lockout_hint:
@@ -3676,6 +4330,89 @@ a {{ color: #2563eb; text-decoration: none; }}
         except Exception:
             return 2.5
 
+    def format_elapsed_seconds(self, seconds: float) -> str:
+        value = max(0.0, float(seconds or 0.0))
+        if value < 60:
+            return f"{value:.1f}s"
+        minutes = int(value // 60)
+        remain = value % 60
+        return f"{minutes}m{remain:04.1f}s"
+
+    def get_llm_summary_display(self, record: AuditRecord) -> str:
+        decision = (record.llm_decision or "").strip()
+        summary = (record.llm_summary or "").strip()
+        if decision and summary:
+            return f"{decision} | {summary}"
+        if decision:
+            return decision
+        if summary:
+            return summary
+        return "-"
+
+    def build_running_result_text(self, record: AuditRecord) -> str:
+        stage = record.analysis_stage or "处理中"
+        parts = [f"分析中: {stage}"]
+        if record.analysis_detail:
+            parts.append(record.analysis_detail)
+        started = record.analysis_started_ts or 0.0
+        if started > 0:
+            parts.append(f"已耗时 {self.format_elapsed_seconds(time.time() - started)}")
+        return " | ".join(parts)
+
+    def refresh_running_record_ui(self, record: AuditRecord, force: bool = False):
+        if record.status != "扫描中...":
+            return
+        now = time.time()
+        if not force and record.analysis_last_ui_ts and now - record.analysis_last_ui_ts < 1.0:
+            return
+        record.analysis_last_ui_ts = now
+        item_id = self.find_item_id_by_record(record)
+        if item_id:
+            self.root.after(
+                0,
+                self.update_tree_item,
+                item_id,
+                record.status,
+                record.title or "-",
+                record.risk_level,
+                self.build_running_result_text(record),
+            )
+
+    def set_record_stage(self, record: AuditRecord, stage: str, detail: str = ""):
+        now = time.time()
+        if not record.analysis_started_ts:
+            record.analysis_started_ts = now
+        stage_changed = stage != record.analysis_stage or detail != record.analysis_detail
+        record.analysis_stage = stage
+        record.analysis_detail = detail
+        if stage_changed:
+            record.analysis_stage_ts = now
+            record.analysis_warned_stage = ""
+            self.log_record_trace(record, f"阶段切换 | stage={stage} | detail={detail or '-'}")
+        self.refresh_running_record_ui(record, force=True)
+
+    def clear_record_stage(self, record: AuditRecord):
+        record.analysis_stage = ""
+        record.analysis_detail = ""
+        record.analysis_started_ts = 0.0
+        record.analysis_stage_ts = 0.0
+        record.analysis_last_ui_ts = 0.0
+        record.analysis_warned_stage = ""
+
+    def monitor_running_records(self, records: list[AuditRecord]):
+        now = time.time()
+        for record in records:
+            if record.status != "扫描中...":
+                continue
+            self.refresh_running_record_ui(record)
+            stage_elapsed = now - (record.analysis_stage_ts or record.analysis_started_ts or now)
+            if stage_elapsed >= 20 and record.analysis_warned_stage != record.analysis_stage:
+                stage_name = record.analysis_stage or "处理中"
+                self.log_queue.put(
+                    f"[~] {record.target} 当前停留在“{stage_name}”，已持续 {self.format_elapsed_seconds(stage_elapsed)}。"
+                )
+                record.analysis_warned_stage = record.analysis_stage
+
     def reset_record_for_rescan(self, record: AuditRecord):
         fresh = AuditRecord(record_id=record.record_id, target=record.target)
         for field_name, value in fresh.__dict__.items():
@@ -3774,7 +4511,18 @@ a {{ color: #2563eb; text-decoration: none; }}
             self.disable_proxy_controls_for_scan()
             self.save_progress_snapshot(reason="scan-start")
             self.log_message("[*] 初始化登录面审计引擎...")
-            self.log_message(f"[*] 当前识别模式: {self.mode_var.get()}")
+            current_mode = self.normalize_analysis_mode(self.mode_var.get())
+            self.mode_var.set(current_mode)
+            self.log_message(f"[*] 当前识别模式: {current_mode}")
+            if current_mode in {MODE_NLP, MODE_NLP_LLM}:
+                self.log_message("[~] 当前 NLP模式是本地关键词加权识别，不是语义大模型。")
+            if current_mode in {MODE_LLM, MODE_RULE_LLM, MODE_NLP_LLM}:
+                if self.is_llm_configured():
+                    self.log_message(
+                        f"[*] 大模型分析: 已配置 | style={self.get_llm_api_style()} | endpoint={self.get_llm_endpoint()} | model={self.llm_model_entry.get().strip()} | timeout={self.get_llm_timeout_seconds():.0f}s | 截图={'开' if self.llm_include_screenshot_var.get() else '关'}"
+                    )
+                else:
+                    self.log_message("[~] 当前模式需要大模型，但尚未配置接口URL或模型名，运行时会跳过大模型分析。")
             self.log_message(f"[*] 当前并发数: {self.get_worker_count()}")
             self.log_message(
                 f"[*] 截图策略: {self.capture_policy_var.get()} | 截图节流: {self.get_capture_delay():.1f}s"
@@ -3851,15 +4599,18 @@ a {{ color: #2563eb; text-decoration: none; }}
             for record in pending_records:
                 if not self.is_scanning:
                     break
+                self.clear_record_stage(record)
+                record.status = "扫描中..."
+                self.set_record_stage(record, "等待线程", "已进入分析队列")
                 item_id = self.find_item_id_by_record(record)
                 if item_id:
-                    self.root.after(0, self.update_tree_item, item_id, "扫描中...", record.title or "-", record.risk_level, "正在分析")
-                record.status = "扫描中..."
+                    self.root.after(0, self.update_tree_item, item_id, "扫描中...", record.title or "-", record.risk_level, self.build_running_result_text(record))
                 self.log_queue.put(f"[>] 正在分析: {record.target}")
                 future = executor.submit(self.inspect_target_threadsafe, record, screenshot_dir)
                 future_map[future] = record
 
             while future_map:
+                self.monitor_running_records(list(future_map.values()))
                 done, _pending = concurrent.futures.wait(
                     future_map.keys(),
                     timeout=0.2,
@@ -3874,6 +4625,7 @@ a {{ color: #2563eb; text-decoration: none; }}
                     item_id = self.find_item_id_by_record(record)
                     try:
                         analyzed = future.result()
+                        self.clear_record_stage(analyzed)
                         if item_id:
                             self.root.after(
                                 0,
@@ -3888,6 +4640,7 @@ a {{ color: #2563eb; text-decoration: none; }}
                             self.root.after(0, self.apply_filter)
                         self.schedule_progress_snapshot(reason="record-updated")
                     except requests.exceptions.ProxyError:
+                        self.clear_record_stage(record)
                         record.status = "已完成"
                         record.risk_level = "失败"
                         record.result = "代理连接失败，请检查代理配置或代理服务状态"
@@ -3902,6 +4655,7 @@ a {{ color: #2563eb; text-decoration: none; }}
                         future_map.clear()
                         break
                     except Exception as exc:
+                        self.clear_record_stage(record)
                         result_summary, error_text = describe_request_exception(exc)
                         record.status = "已完成"
                         record.risk_level = "失败"
@@ -3933,6 +4687,7 @@ a {{ color: #2563eb; text-decoration: none; }}
             session = self.build_requests_session(proxy_addr)
             record.proxy_used = proxy_addr or ""
             try:
+                self.set_record_stage(record, "建立连接", f"出口={record.proxy_used or '直连'}")
                 analyzed = self.inspect_target(session, record, screenshot_dir)
                 self.mark_proxy_success(proxy_addr or "")
                 return analyzed
@@ -3960,6 +4715,7 @@ a {{ color: #2563eb; text-decoration: none; }}
         text_blob = self.collect_text_blob(soup)
         record.password_field_count = self.estimate_password_field_count(soup)
         record.captcha_present = self.contains_any(text_blob, CAPTCHA_KEYWORDS) or self.has_captcha_widget(soup)
+        record.slider_captcha_present = self.contains_any(text_blob, SLIDER_CAPTCHA_KEYWORDS) or self.has_slider_captcha_widget(soup)
         record.mfa_present = self.contains_any(text_blob, MFA_KEYWORDS)
         record.lockout_hint = self.contains_any(text_blob, LOCKOUT_KEYWORDS)
         record.default_hint = self.contains_any(text_blob, DEFAULT_HINT_KEYWORDS)
@@ -3973,6 +4729,8 @@ a {{ color: #2563eb; text-decoration: none; }}
             findings.append("疑似登录页")
         if record.default_hint:
             findings.append("存在默认账号/初始密码提示")
+        if record.slider_captcha_present:
+            findings.append("存在滑块验证码")
         if not record.captcha_present and actionable_login:
             findings.append("未见验证码")
         if not record.mfa_present and actionable_login:
@@ -3988,7 +4746,7 @@ a {{ color: #2563eb; text-decoration: none; }}
             f"url={record.final_url or record.target} | title={record.title or '-'} | score={record.login_score} | "
             f"password_count={record.password_field_count} | field_summary={record.field_summary or '-'} | "
             f"login_form={record.login_form} | actionable={actionable_login} | captcha={record.captcha_present} | "
-            f"mfa={record.mfa_present} | lockout={record.lockout_hint} | default_hint={record.default_hint}",
+            f"slider={record.slider_captcha_present} | mfa={record.mfa_present} | lockout={record.lockout_hint} | default_hint={record.default_hint}",
         )
         return soup
 
@@ -4108,6 +4866,7 @@ a {{ color: #2563eb; text-decoration: none; }}
             return None
         try:
             driver.get(url)
+            self.dismiss_browser_certificate_warning(driver)
             self.wait_for_browser_render(driver)
             self.dismiss_browser_obstructions(driver)
             return driver.current_url, driver.page_source or ""
@@ -4130,6 +4889,7 @@ a {{ color: #2563eb; text-decoration: none; }}
         try:
             active_record = getattr(self, "_browser_probe_record", None)
             driver.get(probe_url)
+            self.dismiss_browser_certificate_warning(driver)
             self.wait_for_browser_render(driver)
             self.dismiss_browser_obstructions(driver)
             dom = BruteForceHandler(
@@ -4178,6 +4938,9 @@ a {{ color: #2563eb; text-decoration: none; }}
                 pass
 
     def inspect_target(self, session: requests.Session, record: AuditRecord, screenshot_dir: Path) -> AuditRecord:
+        current_url = record.target
+        current_html = ""
+        self.set_record_stage(record, "HTTP请求", "拉取首页")
         response = session.get(
             record.target,
             timeout=8,
@@ -4185,6 +4948,9 @@ a {{ color: #2563eb; text-decoration: none; }}
             allow_redirects=self.follow_redirect_var.get(),
         )
         response.encoding = response.apparent_encoding or response.encoding
+        current_url = response.url
+        current_html = response.text or ""
+        self.set_record_stage(record, "静态分析", f"HTTP {response.status_code} | {response.url}")
         soup = self.analyze_record_from_html(record, response.url, response.text)
         if response.status_code >= 400:
             record.result = f"{record.result} | HTTP {response.status_code}".strip(" |")
@@ -4203,6 +4969,7 @@ a {{ color: #2563eb; text-decoration: none; }}
         )
 
         if browser_probe_needed:
+            self.set_record_stage(record, "浏览器补扫", "CDP/浏览器渲染探测登录框")
             self._browser_probe_record = record
             probed = self.probe_login_with_browser(record.final_url or record.target, record.proxy_used or None)
             self._browser_probe_record = None
@@ -4218,6 +4985,8 @@ a {{ color: #2563eb; text-decoration: none; }}
                 probe_signal = self.browser_probe_has_login_signal(probed)
                 rendered_url = probed.get("current_url") or record.final_url or record.target
                 rendered_html = probed.get("html") or ""
+                current_url = rendered_url
+                current_html = rendered_html
                 soup = self.analyze_record_from_html(record, rendered_url, rendered_html)
                 if probed.get("login_form"):
                     record.login_form = True
@@ -4246,6 +5015,17 @@ a {{ color: #2563eb; text-decoration: none; }}
                 self.log_record_trace(record, "浏览器补扫失败 | 未获取到有效 probe 结果", level="WARN")
                 record.result = f"{record.result} | 浏览器补扫失败".strip(" |")
 
+        llm_should_run = self.uses_llm_primary() or (self.uses_llm_fallback() and self.should_fallback_to_llm(record))
+        if llm_should_run:
+            self.set_record_stage(record, "大模型分析", "调用外部模型判断登录页")
+            llm_result = self.call_llm_for_page(record, current_url or record.final_url or record.target, current_html or response.text or "")
+            if llm_result is not None:
+                self.apply_llm_analysis_result(record, llm_result)
+            else:
+                reason = self.llm_last_error or "未返回有效结果"
+                record.result = f"{record.result} | 大模型分析失败: {reason}".strip(" |")
+                self.log_record_trace(record, f"大模型分析失败 | reason={reason}", level="WARN")
+
         if self.brute_var.get() and not self.is_actionable_login_record(record):
             record.result = f"{record.result} | 未识别到可用登录框，未进入弱口令尝试".strip(" |")
 
@@ -4258,6 +5038,10 @@ a {{ color: #2563eb; text-decoration: none; }}
             f"[+] {record.target} 分析完成: 标题={record.title or '无标题'} 风险={record.risk_level}"
         )
         if self.brute_var.get() and self.is_actionable_login_record(record):
+            if record.slider_captcha_present:
+                self.set_record_stage(record, "弱口令检测", "检测到滑块验证码，当前版本不支持自动完成")
+            else:
+                self.set_record_stage(record, "弱口令检测", "准备提交账号/密码组合")
             self.log_queue.put(f"[*] 正在对 {record.target} 进行弱口令尝试...")
             brute = BruteForceHandler(
                 session,
@@ -4495,6 +5279,26 @@ a {{ color: #2563eb; text-decoration: none; }}
                 return True
         return False
 
+    def has_slider_captcha_widget(self, soup: BeautifulSoup) -> bool:
+        for tag in soup.find_all(["div", "span", "img", "canvas", "input"]):
+            raw = " ".join(
+                filter(
+                    None,
+                    [
+                        tag.get("src"),
+                        tag.get("class") and " ".join(tag.get("class")),
+                        tag.get("id"),
+                        tag.get("name"),
+                        tag.get("title"),
+                        tag.get("aria-label"),
+                        tag.get("placeholder"),
+                    ],
+                )
+            ).lower()
+            if any(keyword.lower() in raw for keyword in SLIDER_CAPTCHA_KEYWORDS):
+                return True
+        return False
+
     def compute_login_score(self, soup: BeautifulSoup, text_blob: str, title: str) -> int:
         score = 0
         if self.contains_any(title.lower(), LOGIN_KEYWORDS):
@@ -4525,7 +5329,7 @@ a {{ color: #2563eb; text-decoration: none; }}
             if any(hint.lower() in joined for hint in INPUT_HINTS):
                 hint_hits += 1
         score += min(hint_hits, 2)
-        if self.mode_var.get() == "NLP模式":
+        if self.uses_nlp_weighting():
             text_words = re.findall(r"[\u4e00-\u9fa5a-zA-Z0-9]+", text_blob)
             weight = sum(
                 1
@@ -4568,6 +5372,7 @@ a {{ color: #2563eb; text-decoration: none; }}
             return None
         try:
             driver.get(url)
+            self.dismiss_browser_certificate_warning(driver)
             self.wait_for_browser_render(driver)
             self.dismiss_browser_obstructions(driver)
             driver.save_screenshot(str(filename))
@@ -5223,6 +6028,8 @@ a {{ color: #2563eb; text-decoration: none; }}
             f"最终URL: {record.final_url or '-'}",
             f"代理: {record.proxy_used or '直连'}",
             f"OCR: {record.ocr_endpoint_used or '-'}",
+            f"阶段: {record.analysis_stage or '-'}",
+            f"AI: {self.get_llm_summary_display(record)}",
             f"状态: {record.status}    风险: {record.risk_level}",
         ]
         self.preview_meta_var.set("\n".join(meta_lines))
@@ -5260,6 +6067,13 @@ a {{ color: #2563eb; text-decoration: none; }}
 
     def build_record_detail_text(self, record: AuditRecord) -> str:
         lines = [
+            f"当前阶段: {record.analysis_stage or '-'}",
+            f"阶段详情: {record.analysis_detail or '-'}",
+            f"分析耗时: {self.format_elapsed_seconds(time.time() - record.analysis_started_ts) if record.analysis_started_ts else '-'}",
+            f"大模型结论: {record.llm_decision or '-'}",
+            f"大模型摘要: {record.llm_summary or '-'}",
+            f"大模型置信度: {record.llm_confidence:.2f}" if record.llm_decision else "大模型置信度: -",
+            f"大模型证据: {record.llm_evidence or '-'}",
             f"表单方法: {record.form_method or '-'}",
             f"表单Action: {record.form_action or '-'}",
             f"代理出口: {record.proxy_used or '直连'}",
@@ -5272,6 +6086,7 @@ a {{ color: #2563eb; text-decoration: none; }}
             f"登录评分: {record.login_score}",
             f"密码框数量: {record.password_field_count}",
             f"验证码: {'是' if record.captcha_present else '否'}",
+            f"滑块验证码: {'是' if record.slider_captcha_present else '否'}",
             f"MFA: {'是' if record.mfa_present else '否'}",
             f"锁定提示: {'是' if record.lockout_hint else '否'}",
             f"默认账号提示: {'是' if record.default_hint else '否'}",
@@ -5388,7 +6203,8 @@ a {{ color: #2563eb; text-decoration: none; }}
         current = self.tree.item(item_id)["values"]
         record = self.records_by_item.get(item_id)
         tags = (self.tag_for_record(record),) if record else ()
-        self.tree.item(item_id, values=(current[0], current[1], status, title, risk_level, result), tags=tags)
+        llm_summary = self.get_llm_summary_display(record) if record else "-"
+        self.tree.item(item_id, values=(current[0], current[1], status, title, risk_level, llm_summary, result), tags=tags)
         self.update_summary()
         if item_id in self.tree.selection():
             self.update_preview(record)
@@ -5415,7 +6231,7 @@ a {{ color: #2563eb; text-decoration: none; }}
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
                 "reason": reason,
                 "source_file": self.last_loaded_path,
-                "mode": self.mode_var.get(),
+                "mode": self.normalize_analysis_mode(self.mode_var.get()),
                 "use_proxy": self.use_proxy_var.get(),
                 "proxy": self.proxy_entry.get().strip(),
                 "proxy_mode": self.proxy_mode_var.get(),
@@ -5432,6 +6248,13 @@ a {{ color: #2563eb; text-decoration: none; }}
                 "ocr_endpoint": self.ocr_endpoint_entry.get().strip(),
                 "ocr_route_file": self.ocr_route_entry.get().strip(),
                 "locator_rule_file": self.locator_rule_entry.get().strip(),
+                "llm_base_url": self.llm_base_url_entry.get().strip(),
+                "llm_api_style": self.get_llm_api_style(),
+                "llm_api_key": self.llm_api_key_entry.get().strip(),
+                "llm_model": self.llm_model_entry.get().strip(),
+                "llm_timeout": self.llm_timeout_var.get().strip(),
+                "llm_include_screenshot": self.llm_include_screenshot_var.get(),
+                "llm_prompt": self.get_llm_prompt(),
                 "follow_redirect": self.follow_redirect_var.get(),
                 "workers": self.worker_var.get(),
                 "filter": self.filter_var.get(),
@@ -5503,7 +6326,7 @@ a {{ color: #2563eb; text-decoration: none; }}
         if self.last_loaded_path:
             self.file_entry.delete(0, tk.END)
             self.file_entry.insert(0, self.last_loaded_path)
-        self.mode_var.set(payload.get("mode", "规则模式"))
+        self.mode_var.set(self.normalize_analysis_mode(payload.get("mode", DEFAULT_ANALYSIS_MODE)))
         self.use_proxy_var.set(bool(payload.get("use_proxy", False)))
         self.proxy_entry.config(state=tk.NORMAL)
         self.proxy_entry.delete(0, tk.END)
@@ -5516,8 +6339,8 @@ a {{ color: #2563eb; text-decoration: none; }}
         self.proxy_fail_threshold_var.set(str(payload.get("proxy_fail_threshold", "2")))
         self.proxy_cooldown_var.set(str(payload.get("proxy_cooldown", "120")))
         self.capture_var.set(bool(payload.get("capture", True)))
-        saved_capture_policy = payload.get("capture_policy", CAPTURE_POLICY_HIT)
-        self.capture_policy_var.set(saved_capture_policy if saved_capture_policy in CAPTURE_POLICY_OPTIONS else CAPTURE_POLICY_HIT)
+        saved_capture_policy = payload.get("capture_policy", CAPTURE_POLICY_LOGIN)
+        self.capture_policy_var.set(saved_capture_policy if saved_capture_policy in CAPTURE_POLICY_OPTIONS else CAPTURE_POLICY_LOGIN)
         self.capture_delay_var.set(str(payload.get("capture_delay", "0.4")))
         self.browser_render_var.set(bool(payload.get("browser_render", True)))
         self.render_wait_var.set(str(payload.get("render_wait", "2.5")))
@@ -5528,6 +6351,18 @@ a {{ color: #2563eb; text-decoration: none; }}
         self.ocr_route_entry.insert(0, payload.get("ocr_route_file", ""))
         self.locator_rule_entry.delete(0, tk.END)
         self.locator_rule_entry.insert(0, payload.get("locator_rule_file", ""))
+        self.llm_base_url_entry.delete(0, tk.END)
+        self.llm_base_url_entry.insert(0, payload.get("llm_base_url", ""))
+        saved_llm_style = payload.get("llm_api_style", DEFAULT_LLM_API_STYLE)
+        self.llm_api_style_var.set(saved_llm_style if saved_llm_style in LLM_API_STYLE_OPTIONS else DEFAULT_LLM_API_STYLE)
+        self.llm_api_key_entry.delete(0, tk.END)
+        self.llm_api_key_entry.insert(0, payload.get("llm_api_key", ""))
+        self.llm_model_entry.delete(0, tk.END)
+        self.llm_model_entry.insert(0, payload.get("llm_model", ""))
+        self.llm_timeout_var.set(str(payload.get("llm_timeout", DEFAULT_LLM_TIMEOUT_SECONDS)))
+        self.llm_include_screenshot_var.set(bool(payload.get("llm_include_screenshot", True)))
+        self.llm_prompt_text.delete("1.0", tk.END)
+        self.llm_prompt_text.insert("1.0", payload.get("llm_prompt", DEFAULT_LLM_PROMPT))
         self.follow_redirect_var.set(bool(payload.get("follow_redirect", True)))
         self.worker_var.set(str(payload.get("workers", "4")))
         self.filter_var.set(payload.get("filter", "全部"))
