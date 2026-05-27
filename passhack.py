@@ -16,7 +16,7 @@ import tempfile
 import time
 import warnings
 import webbrowser
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -287,6 +287,23 @@ COMMON_LOGIN_ROUTE_SUFFIXES = [
 DEFAULT_OCR_ENDPOINT = "http://127.0.0.1:8888/reg"
 PROXY_MODE_SINGLE = "单代理/Clash"
 PROXY_MODE_POOL = "代理池轮换"
+PROXY_SCHEME_HTTP = "HTTP/Clash"
+PROXY_SCHEME_SOCKS5 = "SOCKS5"
+PROXY_SCHEME_SOCKS5H = "SOCKS5H"
+PROXY_SCHEME_OPTIONS = [
+    PROXY_SCHEME_HTTP,
+    PROXY_SCHEME_SOCKS5,
+    PROXY_SCHEME_SOCKS5H,
+]
+PROXY_STRATEGY_DIRECT_FIRST = "直连优先"
+PROXY_STRATEGY_PROXY_ONLY = "仅代理"
+PROXY_STRATEGY_DIRECT_ONLY = "仅直连"
+PROXY_STRATEGY_OPTIONS = [
+    PROXY_STRATEGY_DIRECT_FIRST,
+    PROXY_STRATEGY_PROXY_ONLY,
+    PROXY_STRATEGY_DIRECT_ONLY,
+]
+DEFAULT_PRECHECK_COUNT = "3"
 CAPTURE_POLICY_HIT = "命中项"
 CAPTURE_POLICY_HIGH = "仅高风险"
 CAPTURE_POLICY_ALL = "全部截图"
@@ -311,6 +328,9 @@ MODE_OPTIONS = [
 ]
 DEFAULT_ANALYSIS_MODE = MODE_RULE_LLM
 DEFAULT_LLM_TIMEOUT_SECONDS = "45"
+DEFAULT_RECORD_HARD_TIMEOUT_SECONDS = 120.0
+DEFAULT_HTTP_STAGE_TIMEOUT_SECONDS = 25.0
+DEFAULT_WAITING_STAGE_TIMEOUT_SECONDS = 300.0
 LLM_API_STYLE_AUTO = "自动(OpenAI兼容)"
 LLM_API_STYLE_CHAT = "OpenAI Chat Completions"
 LLM_API_STYLE_RESPONSES = "OpenAI Responses API"
@@ -415,6 +435,7 @@ class AuditRecord:
     title: str = ""
     risk_level: str = "-"
     result: str = "-"
+    route_strategy_used: str = ""
     login_score: int = 0
     login_form: bool = False
     password_field_count: int = 0
@@ -428,6 +449,7 @@ class AuditRecord:
     field_summary: str = ""
     screenshot_path: str = ""
     error: str = ""
+    http_error_status: int = 0
     analysis_stage: str = ""
     analysis_detail: str = ""
     analysis_started_ts: float = 0.0
@@ -451,6 +473,7 @@ class BruteForceHandler:
         ocr_endpoint_resolver=None,
         locator_rule_resolver=None,
         captcha_lock=None,
+        progress_callback=None,
     ):
         self.session = session
         self.log_queue = log_queue
@@ -463,6 +486,21 @@ class BruteForceHandler:
         self.ocr_endpoint_resolver = ocr_endpoint_resolver
         self.locator_rule_resolver = locator_rule_resolver
         self.captcha_lock = captcha_lock
+        self.progress_callback = progress_callback
+
+    def report_progress(self, detail: str):
+        callback = self.progress_callback
+        if not callback:
+            return
+        try:
+            callback(detail)
+        except Exception:
+            pass
+
+    def format_attempt_progress(self, attempt_index: int, total_attempts: int, username: str, mode_label: str) -> str:
+        if total_attempts > 0:
+            return f"{mode_label} {attempt_index}/{total_attempts} | user={username}"
+        return f"{mode_label} {attempt_index} | user={username}"
 
     def run(
         self,
@@ -483,10 +521,12 @@ class BruteForceHandler:
             users, passwords, dict_label = self.load_dicts(dict_mode, user_dict_path, pass_dict_path)
         except ValueError as exc:
             return f"失败({exc})"
+        total_attempts = len(users) * len(passwords)
+        self.report_progress(f"字典={dict_label} | 共 {total_attempts} 组")
 
         browser_result = ""
         if self.should_use_browser_login(record):
-            browser_result = self.run_browser_login(record, users, passwords, dict_label)
+            browser_result = self.run_browser_login(record, users, passwords, dict_label, total_attempts)
             if not browser_result.startswith("回退静态模式"):
                 return browser_result
 
@@ -526,6 +566,7 @@ class BruteForceHandler:
             for p in passwords:
                 try:
                     attempt_count += 1
+                    self.report_progress(self.format_attempt_progress(attempt_count, total_attempts, u, "静态提交"))
                     payload = dict(base_payload)
                     payload[user_key] = u
                     payload[pass_key] = p
@@ -594,12 +635,13 @@ class BruteForceHandler:
         except Exception:
             pass
 
-    def run_browser_login(self, record, users, passwords, dict_label):
+    def run_browser_login(self, record, users, passwords, dict_label, total_attempts: int = 0):
         needs_captcha = bool(record.captcha_present)
         if needs_captcha and not self.captcha_ocr_enabled:
             return "跳过(存在图形验证码且未启用本地OCR)"
 
         if needs_captcha and self.captcha_lock:
+            self.report_progress("检测到验证码，等待串行队列")
             self.log(f"[*] {record.target} 存在验证码，进入串行弱口令队列。")
             self.captcha_lock.acquire()
 
@@ -618,6 +660,7 @@ class BruteForceHandler:
                     for password in passwords:
                         attempt_count += 1
                         try:
+                            self.report_progress(self.format_attempt_progress(attempt_count, total_attempts, username, "浏览器提交"))
                             driver.get(login_url)
                             self.wait_for_render(driver)
                             self.dismiss_browser_obstructions(driver)
@@ -629,6 +672,9 @@ class BruteForceHandler:
 
                             captcha_text = ""
                             if needs_captcha or dom["captcha"]:
+                                self.report_progress(
+                                    self.format_attempt_progress(attempt_count, total_attempts, username, "验证码识别")
+                                )
                                 captcha_text = self.solve_captcha_from_dom(driver, dom, record)
                                 if not captcha_text:
                                     if needs_captcha:
@@ -1319,6 +1365,9 @@ class SecurityAuditGUI:
         self.proxy_assignment = {}
         self.proxy_round_robin_index = 0
         self.proxy_health = {}
+        self.brute_future_map = {}
+        self.brute_executor = None
+        self.brute_task_queue = deque()
         self.ensure_builtin_dict_files()
         self.setup_theme()
         self.setup_ui()
@@ -1646,6 +1695,75 @@ class SecurityAuditGUI:
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
+    def decode_json_response(self, response: requests.Response) -> dict:
+        content = response.content or b""
+        candidates = []
+        for encoding in ("utf-8", "utf-8-sig", response.encoding, response.apparent_encoding, "gb18030"):
+            if encoding and encoding not in candidates:
+                candidates.append(encoding)
+        for encoding in candidates:
+            try:
+                return json.loads(content.decode(encoding))
+            except Exception:
+                continue
+        return response.json()
+
+    def response_text_candidates(self, response: requests.Response) -> list[tuple[str, str]]:
+        raw_content = getattr(response, "content", None) or b""
+        candidates = []
+        encodings = [
+            getattr(response, "encoding", None),
+            getattr(response, "apparent_encoding", None),
+            "utf-8",
+            "utf-8-sig",
+            "gb18030",
+            "gbk",
+            "big5",
+        ]
+        seen = set()
+        for encoding in encodings:
+            if not encoding:
+                continue
+            normalized = str(encoding).lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            try:
+                if raw_content:
+                    candidates.append((encoding, raw_content.decode(encoding, errors="replace")))
+            except Exception:
+                continue
+        try:
+            candidates.append((getattr(response, "encoding", "") or "requests", response.text or ""))
+        except Exception:
+            pass
+        return candidates
+
+    def mojibake_score(self, text: str) -> int:
+        sample = (text or "")[:10000]
+        bad_tokens = ("�", "Ã", "Â", "Ð", "Ñ", "寮", "卞", "彛", "浠", "妫", "娴", "鍑", "嗗", "璐", "彿")
+        return sum(sample.count(token) for token in bad_tokens)
+
+    def choose_response_text(self, response: requests.Response) -> tuple[str, str]:
+        try:
+            best_text = response.text or ""
+        except Exception:
+            best_text = ""
+        best_encoding = getattr(response, "encoding", None) or ""
+        best_score = self.mojibake_score(best_text)
+        preferred_order = {"utf-8": 0, "utf-8-sig": 1, "gb18030": 2, "gbk": 3, "big5": 4}
+        for encoding, text in self.response_text_candidates(response):
+            score = self.mojibake_score(text)
+            current_priority = preferred_order.get(str(encoding).lower(), 99)
+            best_priority = preferred_order.get(str(best_encoding).lower(), 99)
+            if score < best_score or (score == best_score and current_priority < best_priority):
+                best_encoding = encoding
+                best_text = text
+                best_score = score
+        if best_encoding:
+            response.encoding = best_encoding
+        return best_text, best_encoding
+
     def extract_llm_content(self, data: dict, api_style: str) -> str:
         if api_style == LLM_API_STYLE_OLLAMA:
             message = data.get("message") or {}
@@ -1762,7 +1880,7 @@ class SecurityAuditGUI:
                     verify=False,
                 )
                 response.raise_for_status()
-                data = response.json()
+                data = self.decode_json_response(response)
                 content = self.extract_llm_content(data, api_style)
                 return data, content, api_style, endpoint
             except Exception as exc:
@@ -1853,6 +1971,8 @@ class SecurityAuditGUI:
 
     def should_fallback_to_llm(self, record: AuditRecord) -> bool:
         result_text = record.result or ""
+        if record.http_error_status >= 400:
+            return False
         return bool(
             not record.login_form
             or not self.is_actionable_login_record(record)
@@ -2013,7 +2133,15 @@ class SecurityAuditGUI:
         for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"):
             env.pop(key, None)
         env["CHROME_LOG_FILE"] = os.devnull
+        env["EDGE_LOG_FILE"] = os.devnull
         return env
+
+    def get_subprocess_creationflags(self) -> int:
+        return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    def is_browser_error_url(self, value: str) -> bool:
+        current = (value or "").strip().lower()
+        return current.startswith("chrome-error://") or current.startswith("edge-error://")
 
     def normalize_analysis_mode(self, value: str) -> str:
         mapping = {
@@ -2047,6 +2175,15 @@ class SecurityAuditGUI:
             return False
         field_summary = (record.field_summary or "").lower()
         return bool(record.password_field_count > 0 or "password:" in field_summary)
+
+    def should_run_bruteforce_for_record(self, record: AuditRecord | None) -> bool:
+        if record is None or not self.brute_var.get():
+            return False
+        if record.slider_captcha_present:
+            return False
+        if self.is_actionable_login_record(record):
+            return True
+        return "浏览器渲染补扫命中" in (record.result or "")
 
     def detail_log_path_for_project(self, project_path: Path | None = None) -> Path:
         path = project_path or self.current_project_path
@@ -2183,12 +2320,16 @@ class SecurityAuditGUI:
         return port
 
     def build_browser_launch_args(self, proxy_addr: str | None = None) -> list[str]:
-        proxy_value = self.normalize_proxy_address(proxy_addr or "")
-        if not proxy_value and self.use_proxy_var.get() and self.proxy_mode_var.get() == PROXY_MODE_SINGLE:
-            proxy_value = self.normalize_proxy_address(self.proxy_entry.get())
+        proxy_value = self.get_browser_proxy_address(proxy_addr or "")
+        if not proxy_value and self.use_proxy_var.get():
+            proxy_value = self.get_browser_proxy_address(self.proxy_entry.get())
 
         common_args = [
             "--headless=new",
+            "--silent",
+            "--disable-default-apps",
+            "--disable-sync",
+            "--metrics-recording-only",
             "--ignore-certificate-errors",
             "--disable-gpu",
             "--disable-popup-blocking",
@@ -2234,7 +2375,13 @@ class SecurityAuditGUI:
         session = requests.Session()
         session.trust_env = False
         try:
-            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                creationflags=self.get_subprocess_creationflags(),
+            )
             targets = []
             for _ in range(50):
                 try:
@@ -2584,7 +2731,14 @@ JSON.stringify((() => {
         ]
         env = self.build_browser_env()
         try:
-            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, env=env)
+            result = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                env=env,
+                creationflags=self.get_subprocess_creationflags(),
+            )
             if result.returncode == 0 and filename.exists() and filename.stat().st_size > 0:
                 return filename
         except Exception:
@@ -2646,7 +2800,6 @@ JSON.stringify((() => {
         proxy_row = tk.Frame(scan_frame, bg=scan_frame.cget("bg"))
         proxy_row.pack(fill=tk.X)
         proxy_row.columnconfigure(2, weight=1)
-        proxy_row.columnconfigure(6, weight=1)
 
         self.use_proxy_var = tk.BooleanVar(value=False)
         self.make_checkbutton(
@@ -2661,58 +2814,59 @@ JSON.stringify((() => {
         self.proxy_entry.insert(0, "127.0.0.1:8080")
         self.proxy_entry.grid(row=0, column=2, sticky="ew", padx=(0, 12))
 
-        self.make_label(proxy_row, text="代理模式:").grid(row=0, column=3, sticky="w", padx=(0, 4))
         self.proxy_mode_var = tk.StringVar(value=PROXY_MODE_SINGLE)
-        self.proxy_mode_box = ttk.Combobox(
+        self.make_label(proxy_row, text="连接策略:").grid(row=0, column=3, sticky="w", padx=(0, 4))
+        self.proxy_strategy_var = tk.StringVar(value=PROXY_STRATEGY_DIRECT_FIRST)
+        self.proxy_strategy_box = ttk.Combobox(
             proxy_row,
-            textvariable=self.proxy_mode_var,
-            values=[PROXY_MODE_SINGLE, PROXY_MODE_POOL],
-            width=14,
+            textvariable=self.proxy_strategy_var,
+            values=PROXY_STRATEGY_OPTIONS,
+            width=10,
             state="readonly",
         )
-        self.proxy_mode_box.grid(row=0, column=4, sticky="w", padx=(0, 12))
-        self.proxy_mode_box.bind("<<ComboboxSelected>>", lambda _event: self.toggle_proxy_state())
+        self.proxy_strategy_box.grid(row=0, column=4, sticky="w", padx=(0, 12))
 
-        self.make_label(proxy_row, text="代理池:").grid(row=0, column=5, sticky="w", padx=(0, 4))
-        self.proxy_pool_entry = self.make_entry(proxy_row, width=28, state=tk.DISABLED)
-        self.proxy_pool_entry.grid(row=0, column=6, sticky="ew", padx=(0, 6))
-        self.proxy_pool_button = self.make_button(proxy_row, text="选择...", command=self.browse_proxy_pool, state=tk.DISABLED)
-        self.proxy_pool_button.grid(row=0, column=7, sticky="w")
+        self.make_label(proxy_row, text="代理协议:").grid(row=0, column=5, sticky="w", padx=(0, 4))
+        self.proxy_scheme_var = tk.StringVar(value=PROXY_SCHEME_HTTP)
+        self.proxy_scheme_box = ttk.Combobox(
+            proxy_row,
+            textvariable=self.proxy_scheme_var,
+            values=PROXY_SCHEME_OPTIONS,
+            width=12,
+            state="readonly",
+        )
+        self.proxy_scheme_box.grid(row=0, column=6, sticky="w", padx=(0, 12))
+
+        self.make_label(proxy_row, text="预检次数:").grid(row=0, column=7, sticky="w", padx=(0, 4))
+        self.proxy_precheck_var = tk.StringVar(value=DEFAULT_PRECHECK_COUNT)
+        self.proxy_precheck_box = ttk.Combobox(
+            proxy_row,
+            textvariable=self.proxy_precheck_var,
+            values=["1", "2", "3"],
+            width=4,
+            state="readonly",
+        )
+        self.proxy_precheck_box.grid(row=0, column=8, sticky="w")
 
         scan_row = tk.Frame(scan_frame, bg=scan_frame.cget("bg"))
         scan_row.pack(fill=tk.X, pady=(8, 0))
 
-        self.make_label(scan_row, text="失败重试:").grid(row=0, column=0, sticky="w")
-        self.proxy_retry_var = tk.StringVar(value="2")
-        self.proxy_retry_box = ttk.Combobox(scan_row, textvariable=self.proxy_retry_var, values=["1", "2", "3", "4", "5"], width=4, state="readonly")
-        self.proxy_retry_box.grid(row=0, column=1, sticky="w", padx=(4, 12))
-
-        self.make_label(scan_row, text="熔断阈值:").grid(row=0, column=2, sticky="w")
-        self.proxy_fail_threshold_var = tk.StringVar(value="2")
-        self.proxy_fail_threshold_box = ttk.Combobox(scan_row, textvariable=self.proxy_fail_threshold_var, values=["1", "2", "3", "4", "5"], width=4, state="readonly")
-        self.proxy_fail_threshold_box.grid(row=0, column=3, sticky="w", padx=(4, 12))
-
-        self.make_label(scan_row, text="冷却:").grid(row=0, column=4, sticky="w")
-        self.proxy_cooldown_var = tk.StringVar(value="120")
-        self.proxy_cooldown_box = ttk.Combobox(scan_row, textvariable=self.proxy_cooldown_var, values=["30", "60", "120", "300", "600"], width=5, state="readonly")
-        self.proxy_cooldown_box.grid(row=0, column=5, sticky="w", padx=(4, 12))
-
-        self.make_label(scan_row, text="识别模式:").grid(row=0, column=6, sticky="w")
+        self.make_label(scan_row, text="识别模式:").grid(row=0, column=0, sticky="w")
         self.mode_var = tk.StringVar(value=DEFAULT_ANALYSIS_MODE)
-        ttk.Combobox(scan_row, textvariable=self.mode_var, values=MODE_OPTIONS, width=16, state="readonly").grid(row=0, column=7, sticky="w", padx=(4, 12))
+        ttk.Combobox(scan_row, textvariable=self.mode_var, values=MODE_OPTIONS, width=16, state="readonly").grid(row=0, column=1, sticky="w", padx=(4, 12))
 
         self.capture_var = tk.BooleanVar(value=True)
-        self.make_checkbutton(scan_row, text="尝试截图", variable=self.capture_var).grid(row=0, column=8, sticky="w", padx=(0, 12))
+        self.make_checkbutton(scan_row, text="尝试截图", variable=self.capture_var).grid(row=0, column=2, sticky="w", padx=(0, 12))
 
-        self.make_label(scan_row, text="截图策略:").grid(row=0, column=9, sticky="w")
-        self.capture_policy_var = tk.StringVar(value=CAPTURE_POLICY_LOGIN)
+        self.make_label(scan_row, text="截图策略:").grid(row=0, column=3, sticky="w")
+        self.capture_policy_var = tk.StringVar(value=CAPTURE_POLICY_ALL)
         ttk.Combobox(
             scan_row,
             textvariable=self.capture_policy_var,
             values=CAPTURE_POLICY_OPTIONS,
             width=14,
             state="readonly",
-        ).grid(row=0, column=10, sticky="w", padx=(4, 0))
+        ).grid(row=0, column=4, sticky="w", padx=(4, 0))
 
         advanced_row = tk.Frame(scan_frame, bg=scan_frame.cget("bg"))
         advanced_row.pack(fill=tk.X, pady=(8, 0))
@@ -3075,24 +3229,34 @@ JSON.stringify((() => {
 
     def toggle_proxy_state(self):
         enabled = self.use_proxy_var.get()
-        pool_mode = self.proxy_mode_var.get() == PROXY_MODE_POOL
+        self.proxy_mode_var.set(PROXY_MODE_SINGLE)
+        strategy = self.get_proxy_strategy()
+        proxy_controls_enabled = enabled and strategy != PROXY_STRATEGY_DIRECT_ONLY
+        self.proxy_strategy_box.config(state="readonly" if enabled else tk.DISABLED)
+        self.proxy_entry.config(state=tk.NORMAL if proxy_controls_enabled else tk.DISABLED)
+        self.proxy_scheme_box.config(state="readonly" if proxy_controls_enabled else tk.DISABLED)
+        self.proxy_precheck_box.config(state="readonly" if enabled else tk.DISABLED)
 
-        self.proxy_mode_box.config(state="readonly" if enabled else tk.DISABLED)
-        self.proxy_retry_box.config(state="readonly" if enabled else tk.DISABLED)
-        self.proxy_fail_threshold_box.config(state="readonly" if enabled else tk.DISABLED)
-        self.proxy_cooldown_box.config(state="readonly" if enabled else tk.DISABLED)
-        self.proxy_entry.config(state=tk.NORMAL if enabled and not pool_mode else tk.DISABLED)
-        self.proxy_pool_entry.config(state=tk.NORMAL if enabled and pool_mode else tk.DISABLED)
-        self.proxy_pool_button.config(state=tk.NORMAL if enabled and pool_mode else tk.DISABLED)
+    def describe_proxy_strategy(self) -> str:
+        strategy = self.get_proxy_strategy()
+        mapping = {
+            PROXY_STRATEGY_DIRECT_FIRST: "直连优先，失败后再走代理",
+            PROXY_STRATEGY_PROXY_ONLY: "仅代理",
+            PROXY_STRATEGY_DIRECT_ONLY: "仅直连",
+        }
+        return mapping.get(strategy, strategy)
+
+    def get_proxy_precheck_count(self) -> int:
+        try:
+            return max(1, min(3, int(self.proxy_precheck_var.get())))
+        except Exception:
+            return 3
 
     def disable_proxy_controls_for_scan(self):
         self.proxy_entry.config(state=tk.DISABLED)
-        self.proxy_mode_box.config(state=tk.DISABLED)
-        self.proxy_pool_entry.config(state=tk.DISABLED)
-        self.proxy_pool_button.config(state=tk.DISABLED)
-        self.proxy_retry_box.config(state=tk.DISABLED)
-        self.proxy_fail_threshold_box.config(state=tk.DISABLED)
-        self.proxy_cooldown_box.config(state=tk.DISABLED)
+        self.proxy_strategy_box.config(state=tk.DISABLED)
+        self.proxy_scheme_box.config(state=tk.DISABLED)
+        self.proxy_precheck_box.config(state=tk.DISABLED)
 
     def browse_ocr_route_file(self):
         path = filedialog.askopenfilename(
@@ -3248,6 +3412,9 @@ JSON.stringify((() => {
         os.startfile(template_path)
 
     def browse_proxy_pool(self):
+        return
+        """
+        """
         path = filedialog.askopenfilename(
             title="选择代理池文件",
             filetypes=[("Text files", "*.txt *.lst *.csv"), ("All files", "*.*")],
@@ -3259,31 +3426,87 @@ JSON.stringify((() => {
         self.proxy_pool_entry.insert(0, path)
         self.toggle_proxy_state()
 
+    def get_proxy_scheme_name(self) -> str:
+        value = getattr(self, "proxy_scheme_var", None)
+        if value is None:
+            return PROXY_SCHEME_HTTP
+        current = value.get()
+        if current in PROXY_SCHEME_OPTIONS:
+            return current
+        return PROXY_SCHEME_HTTP
+
+    def get_proxy_strategy(self) -> str:
+        value = getattr(self, "proxy_strategy_var", None)
+        if value is None:
+            return PROXY_STRATEGY_DIRECT_FIRST
+        current = value.get()
+        if current in PROXY_STRATEGY_OPTIONS:
+            return current
+        return PROXY_STRATEGY_DIRECT_FIRST
+
+    def infer_proxy_scheme_label(self, value: str) -> str:
+        proxy = (value or "").strip().lower()
+        if proxy.startswith("socks5h://"):
+            return PROXY_SCHEME_SOCKS5H
+        if proxy.startswith("socks5://") or proxy.startswith("socks://"):
+            return PROXY_SCHEME_SOCKS5
+        return PROXY_SCHEME_HTTP
+
+    def proxy_scheme_to_url_scheme(self, scheme_name: str | None = None) -> str:
+        mapping = {
+            PROXY_SCHEME_HTTP: "http",
+            PROXY_SCHEME_SOCKS5: "socks5",
+            PROXY_SCHEME_SOCKS5H: "socks5h",
+        }
+        return mapping.get(scheme_name or self.get_proxy_scheme_name(), "http")
+
     def normalize_proxy_address(self, value: str) -> str:
         proxy = (value or "").strip()
         if not proxy:
             return ""
-        if "://" not in proxy:
-            proxy = f"http://{proxy}"
-        return proxy
+        if "://" in proxy:
+            parsed = urlparse(proxy)
+            scheme = (parsed.scheme or "http").lower()
+            if scheme == "socks":
+                scheme = "socks5"
+            host_part = parsed.netloc or parsed.path
+            return f"{scheme}://{host_part}" if host_part else ""
+        return f"{self.proxy_scheme_to_url_scheme()}://{proxy}"
+
+    def get_browser_proxy_address(self, value: str) -> str:
+        normalized = self.normalize_proxy_address(value)
+        if not normalized:
+            return ""
+        parsed = urlparse(normalized)
+        scheme = (parsed.scheme or "http").lower()
+        if scheme == "socks5h":
+            scheme = "socks5"
+        host_part = parsed.netloc or parsed.path
+        return f"{scheme}://{host_part}" if host_part else ""
+
+    def is_socks_proxy(self, value: str) -> bool:
+        normalized = self.normalize_proxy_address(value)
+        if not normalized:
+            return False
+        return (urlparse(normalized).scheme or "").lower().startswith("socks")
+
+    def ensure_proxy_dependencies(self, proxy_value: str) -> str:
+        if not self.is_socks_proxy(proxy_value):
+            return ""
+        try:
+            import socks  # noqa: F401
+        except Exception:
+            return "当前选择 SOCKS5 代理，但 requests 缺少 socks 支持，请先安装 PySocks。"
+        return ""
 
     def get_proxy_retry_count(self) -> int:
-        try:
-            return max(1, min(5, int(self.proxy_retry_var.get())))
-        except Exception:
-            return 2
+        return 1
 
     def get_proxy_fail_threshold(self) -> int:
-        try:
-            return max(1, min(5, int(self.proxy_fail_threshold_var.get())))
-        except Exception:
-            return 2
+        return 1
 
     def get_proxy_cooldown_seconds(self) -> int:
-        try:
-            return max(10, min(3600, int(self.proxy_cooldown_var.get())))
-        except Exception:
-            return 120
+        return 0
 
     def read_text_lines(self, path: Path) -> list[str]:
         last_error = None
@@ -3441,29 +3664,7 @@ JSON.stringify((() => {
         return default_endpoint, default_rule
 
     def load_proxy_pool(self) -> list[str]:
-        path = self.proxy_pool_entry.get().strip()
-        if not path:
-            return []
-        file_path = Path(path)
-        if not file_path.exists():
-            return []
-
-        proxies = []
-        seen = set()
-        try:
-            lines = self.read_text_lines(file_path)
-        except UnicodeError:
-            return []
-
-        for line in lines:
-            item = self.normalize_proxy_address(line.strip())
-            if not item or item.startswith(("#", ";", "//")):
-                continue
-            if item in seen:
-                continue
-            seen.add(item)
-            proxies.append(item)
-        return proxies
+        return []
 
     def get_proxy_health(self, proxy_addr: str) -> dict:
         state = self.proxy_health.setdefault(
@@ -3484,7 +3685,7 @@ JSON.stringify((() => {
         return state.get("cooldown_until", 0.0) > time.time()
 
     def mark_proxy_success(self, proxy_addr: str):
-        if not proxy_addr or self.proxy_mode_var.get() != PROXY_MODE_POOL:
+        if not proxy_addr:
             return
         state = self.get_proxy_health(proxy_addr)
         state["fail_count"] = 0
@@ -3493,11 +3694,13 @@ JSON.stringify((() => {
         state["last_ok"] = time.time()
 
     def mark_proxy_failure(self, proxy_addr: str, error_summary: str):
-        if not proxy_addr or self.proxy_mode_var.get() != PROXY_MODE_POOL:
+        if not proxy_addr:
             return
         state = self.get_proxy_health(proxy_addr)
         state["fail_count"] = int(state.get("fail_count", 0)) + 1
         state["last_error"] = error_summary
+        state["cooldown_until"] = 0.0
+        return
         if state["fail_count"] >= self.get_proxy_fail_threshold():
             cooldown_until = time.time() + self.get_proxy_cooldown_seconds()
             state["cooldown_until"] = cooldown_until
@@ -3531,15 +3734,27 @@ JSON.stringify((() => {
         return f"{hours}h{remain_minutes:02d}m"
 
     def get_proxy_assignment_count(self, proxy_addr: str) -> int:
-        return sum(1 for assigned in self.proxy_assignment.values() if assigned == proxy_addr)
+        return 0
 
     def get_proxy_status_rows(self) -> list[dict]:
         rows = []
-        if self.proxy_mode_var.get() == PROXY_MODE_POOL:
-            proxies = self.load_proxy_pool()
-        else:
-            proxy = self.normalize_proxy_address(self.proxy_entry.get())
-            proxies = [proxy] if proxy else []
+        proxy = self.normalize_proxy_address(self.proxy_entry.get())
+        if not proxy:
+            return rows
+        state = self.get_proxy_health(proxy)
+        status = "最近失败" if state.get("last_error") else "可用"
+        return [
+            {
+                "proxy": proxy,
+                "scheme": self.infer_proxy_scheme_label(proxy),
+                "status": status,
+                "fail_count": state.get("fail_count", 0),
+                "last_error": state.get("last_error", "") or "-",
+                "last_ok": self.format_time_value(state.get("last_ok", 0.0)),
+            }
+        ]
+        proxy = self.normalize_proxy_address(self.proxy_entry.get())
+        proxies = [proxy] if proxy else []
 
         for proxy in proxies:
             state = self.get_proxy_health(proxy)
@@ -3559,54 +3774,69 @@ JSON.stringify((() => {
         return rows
 
     def get_proxy_candidates_for_record(self, record: AuditRecord) -> list[str | None]:
-        if not self.use_proxy_var.get():
+        strategy = self.get_proxy_strategy()
+        if not self.use_proxy_var.get() or strategy == PROXY_STRATEGY_DIRECT_ONLY:
             return [None]
-
-        if self.proxy_mode_var.get() == PROXY_MODE_SINGLE:
-            proxy = self.normalize_proxy_address(self.proxy_entry.get())
-            return [proxy] if proxy else [None]
-
-        pool = self.load_proxy_pool()
-        if not pool:
+        proxy = self.normalize_proxy_address(self.proxy_entry.get())
+        if not proxy:
             return [None]
+        if strategy == PROXY_STRATEGY_PROXY_ONLY:
+            return [proxy]
+        return [None, proxy]
 
-        key = record.target
-        assigned = self.proxy_assignment.get(key)
-        if assigned not in pool:
-            assigned = pool[self.proxy_round_robin_index % len(pool)]
-            self.proxy_assignment[key] = assigned
-            self.proxy_round_robin_index = (self.proxy_round_robin_index + 1) % max(1, len(pool))
+    def probe_connection_candidate(self, target: str, proxy_addr: str | None) -> tuple[bool, float]:
+        session = self.build_requests_session(proxy_addr)
+        best_elapsed = float("inf")
+        attempts = self.get_proxy_precheck_count()
+        success_count = 0
+        for _ in range(attempts):
+            started = time.time()
+            try:
+                response = session.get(
+                    target,
+                    timeout=3,
+                    verify=False,
+                    allow_redirects=True,
+                    stream=True,
+                )
+                response.close()
+                success_count += 1
+                best_elapsed = min(best_elapsed, time.time() - started)
+            except Exception:
+                pass
+        return success_count > 0, best_elapsed
 
-        start_index = pool.index(assigned)
-        ordered = pool[start_index:] + pool[:start_index]
-        healthy = [proxy for proxy in ordered if not self.is_proxy_in_cooldown(proxy)]
-        if healthy:
-            return healthy[: self.get_proxy_retry_count()]
+    def order_connection_candidates(self, target: str, candidates: list[str | None]) -> list[str | None]:
+        if len(candidates) <= 1:
+            return candidates
+        strategy = self.get_proxy_strategy()
+        if strategy != PROXY_STRATEGY_DIRECT_FIRST:
+            return candidates
 
-        fallback = sorted(
-            ordered,
-            key=lambda proxy: self.get_proxy_health(proxy).get("cooldown_until", 0.0),
-        )
-        if fallback:
-            wait_seconds = self.get_proxy_recovery_eta(fallback[0])
-            self.log_queue.put(
-                f"[~] 代理池当前全部处于冷却，临时尝试最先恢复的代理: {fallback[0]} | 剩余约 {wait_seconds}s"
-            )
-        return fallback[: self.get_proxy_retry_count()] or [None]
+        has_direct_candidate = any(candidate is None for candidate in candidates)
+        proxy_candidates = [candidate for candidate in candidates if candidate is not None]
+        if not has_direct_candidate or not proxy_candidates:
+            return candidates
+
+        direct_ok, direct_latency = self.probe_connection_candidate(target, None)
+        if direct_ok:
+            return [None, *proxy_candidates]
+
+        ranked = []
+        for proxy_candidate in proxy_candidates:
+            proxy_ok, proxy_latency = self.probe_connection_candidate(target, proxy_candidate)
+            ranked.append((proxy_ok, proxy_latency, proxy_candidate))
+        ranked.sort(key=lambda item: (not item[0], item[1]))
+        return [candidate for _ok, _latency, candidate in ranked] + [None]
 
     def validate_proxy_settings(self) -> str:
-        if not self.use_proxy_var.get():
+        strategy = self.get_proxy_strategy()
+        if not self.use_proxy_var.get() or strategy == PROXY_STRATEGY_DIRECT_ONLY:
             return ""
-        if self.proxy_mode_var.get() == PROXY_MODE_SINGLE:
-            if not self.normalize_proxy_address(self.proxy_entry.get()):
-                return "已启用代理，但未填写代理地址。"
-            return ""
-        pool = self.load_proxy_pool()
-        if not self.proxy_pool_entry.get().strip():
-            return "已启用代理池轮换，但未选择代理池文件。"
-        if not pool:
-            return "代理池文件为空、编码无法识别，或文件内容无有效代理。"
-        return ""
+        proxy_value = self.normalize_proxy_address(self.proxy_entry.get())
+        if not proxy_value:
+            return "已启用代理，但未填写代理地址。"
+        return self.ensure_proxy_dependencies(proxy_value)
 
     def should_retry_with_next_proxy(self, exc: Exception, attempt_index: int, total_attempts: int) -> bool:
         if attempt_index >= total_attempts:
@@ -4303,7 +4533,7 @@ a {{ color: #2563eb; text-decoration: none; }}
             }
         )
         proxy_value = self.normalize_proxy_address(proxy_addr or "")
-        if not proxy_value and self.use_proxy_var.get() and self.proxy_mode_var.get() == PROXY_MODE_SINGLE:
+        if not proxy_value and self.use_proxy_var.get():
             proxy_value = self.normalize_proxy_address(self.proxy_entry.get())
         if proxy_value:
             session.proxies = {
@@ -4318,6 +4548,9 @@ a {{ color: #2563eb; text-decoration: none; }}
         except Exception:
             return 4
 
+    def get_brute_worker_count(self) -> int:
+        return 1 if self.captcha_ocr_var.get() else min(2, self.get_worker_count())
+
     def get_capture_delay(self) -> float:
         try:
             return max(0.0, min(3.0, float(self.capture_delay_var.get())))
@@ -4329,6 +4562,53 @@ a {{ color: #2563eb; text-decoration: none; }}
             return max(0.8, min(10.0, float(self.render_wait_var.get())))
         except Exception:
             return 2.5
+
+    def get_record_hard_timeout(self) -> float:
+        render_budget = self.get_render_wait() + 35.0 if self.browser_render_var.get() else 0.0
+        llm_budget = self.get_llm_timeout_seconds() + 10.0 if (
+            self.uses_llm_primary() or self.uses_llm_fallback()
+        ) else 0.0
+        return max(DEFAULT_RECORD_HARD_TIMEOUT_SECONDS, DEFAULT_HTTP_STAGE_TIMEOUT_SECONDS + render_budget + llm_budget)
+
+    def is_record_hard_timeout(self, record: AuditRecord) -> bool:
+        if record.analysis_stage == "等待线程":
+            return (
+                record.status == "扫描中..."
+                and record.analysis_stage_ts > 0
+                and time.time() - record.analysis_stage_ts >= DEFAULT_WAITING_STAGE_TIMEOUT_SECONDS
+            )
+        return (
+            record.status == "扫描中..."
+            and record.analysis_started_ts > 0
+            and time.time() - record.analysis_started_ts >= self.get_record_hard_timeout()
+        )
+
+    def is_record_http_stage_timeout(self, record: AuditRecord) -> bool:
+        return (
+            record.status == "扫描中..."
+            and record.analysis_stage == "HTTP请求"
+            and record.analysis_stage_ts > 0
+            and time.time() - record.analysis_stage_ts >= DEFAULT_HTTP_STAGE_TIMEOUT_SECONDS
+        )
+
+    def copy_record_for_worker(self, record: AuditRecord) -> AuditRecord:
+        worker_record = AuditRecord(**asdict(record))
+        setattr(worker_record, "_scan_owner_record", record)
+        return worker_record
+
+    def merge_record_from_worker(self, target: AuditRecord, source: AuditRecord):
+        target.__dict__.update(asdict(source))
+
+    def mark_record_scan_timeout(self, record: AuditRecord, reason: str):
+        elapsed = self.format_elapsed_seconds(time.time() - (record.analysis_started_ts or time.time()))
+        stage = record.analysis_stage or "处理中"
+        detail = record.analysis_detail or "-"
+        self.clear_record_stage(record)
+        record.status = "已完成"
+        record.risk_level = "失败"
+        record.result = reason
+        record.error = f"ScanTimeout: {reason} | stage={stage} | detail={detail} | elapsed={elapsed}"
+        self.log_queue.put(f"[-] {record.target} {reason}，已跳过并继续后续目标。")
 
     def format_elapsed_seconds(self, seconds: float) -> str:
         value = max(0.0, float(seconds or 0.0))
@@ -4378,7 +4658,7 @@ a {{ color: #2563eb; text-decoration: none; }}
                 self.build_running_result_text(record),
             )
 
-    def set_record_stage(self, record: AuditRecord, stage: str, detail: str = ""):
+    def set_record_stage(self, record: AuditRecord, stage: str, detail: str = "", log_change: bool = True):
         now = time.time()
         if not record.analysis_started_ts:
             record.analysis_started_ts = now
@@ -4388,7 +4668,19 @@ a {{ color: #2563eb; text-decoration: none; }}
         if stage_changed:
             record.analysis_stage_ts = now
             record.analysis_warned_stage = ""
-            self.log_record_trace(record, f"阶段切换 | stage={stage} | detail={detail or '-'}")
+            if log_change:
+                self.log_record_trace(record, f"阶段切换 | stage={stage} | detail={detail or '-'}")
+        owner_record = getattr(record, "_scan_owner_record", None)
+        if owner_record is not None:
+            if owner_record.status == "扫描中...":
+                if not owner_record.analysis_started_ts:
+                    owner_record.analysis_started_ts = record.analysis_started_ts
+                owner_record.analysis_stage = record.analysis_stage
+                owner_record.analysis_detail = record.analysis_detail
+                owner_record.analysis_stage_ts = record.analysis_stage_ts
+                owner_record.analysis_warned_stage = record.analysis_warned_stage
+                self.refresh_running_record_ui(owner_record, force=True)
+            return
         self.refresh_running_record_ui(record, force=True)
 
     def clear_record_stage(self, record: AuditRecord):
@@ -4406,6 +4698,13 @@ a {{ color: #2563eb; text-decoration: none; }}
                 continue
             self.refresh_running_record_ui(record)
             stage_elapsed = now - (record.analysis_stage_ts or record.analysis_started_ts or now)
+            if record.analysis_stage == "等待线程":
+                if stage_elapsed >= 90 and record.analysis_warned_stage != record.analysis_stage:
+                    self.log_queue.put(
+                        f"[~] {record.target} 仍在排队等待可用 worker，已持续 {self.format_elapsed_seconds(stage_elapsed)}。"
+                    )
+                    record.analysis_warned_stage = record.analysis_stage
+                continue
             if stage_elapsed >= 20 and record.analysis_warned_stage != record.analysis_stage:
                 stage_name = record.analysis_stage or "处理中"
                 self.log_queue.put(
@@ -4525,6 +4824,9 @@ a {{ color: #2563eb; text-decoration: none; }}
                     self.log_message("[~] 当前模式需要大模型，但尚未配置接口URL或模型名，运行时会跳过大模型分析。")
             self.log_message(f"[*] 当前并发数: {self.get_worker_count()}")
             self.log_message(
+                f"[*] 单目标超时保护: HTTP阶段 {DEFAULT_HTTP_STAGE_TIMEOUT_SECONDS:.0f}s | 总超时 {self.get_record_hard_timeout():.0f}s"
+            )
+            self.log_message(
                 f"[*] 截图策略: {self.capture_policy_var.get()} | 截图节流: {self.get_capture_delay():.1f}s"
             )
             self.log_message(
@@ -4552,7 +4854,7 @@ a {{ color: #2563eb; text-decoration: none; }}
                 self.log_message("[*] 弱口令检测: 未启用")
             self.log_message(f"[*] 本次将从未完成目标继续扫描，已完成记录会自动跳过。")
             if self.use_proxy_var.get():
-                if self.proxy_mode_var.get() == PROXY_MODE_POOL:
+                if False:
                     self.log_message(
                         f"[*] 已启用代理池轮换: 文件={self.proxy_pool_entry.get().strip() or '-'} | "
                         f"失败重试={self.get_proxy_retry_count()} 次 | "
@@ -4561,7 +4863,7 @@ a {{ color: #2563eb; text-decoration: none; }}
                 else:
                     self.log_message(
                         f"[*] 已启用代理: {self.normalize_proxy_address(self.proxy_entry.get()) or '-'} | "
-                        f"模式={self.proxy_mode_var.get()}"
+                        f"策略={self.describe_proxy_strategy()} | 协议={self.get_proxy_scheme_name()}"
                     )
             threading.Thread(target=self.scan_engine, daemon=True).start()
         else:
@@ -4590,27 +4892,73 @@ a {{ color: #2563eb; text-decoration: none; }}
             self.root.after(0, self.reset_scan_button)
             return
 
+        worker_count = self.get_worker_count()
         executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.get_worker_count(),
+            max_workers=worker_count,
             thread_name_prefix="audit",
         )
         future_map = {}
+        pending_queue = deque(pending_records)
+
+        def restart_audit_executor():
+            nonlocal executor
+            executor.shutdown(wait=False, cancel_futures=True)
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="audit",
+            )
+
+        def submit_next_record() -> bool:
+            if not self.is_scanning or not pending_queue:
+                return False
+            record = pending_queue.popleft()
+            self.clear_record_stage(record)
+            record.status = "扫描中..."
+            self.set_record_stage(record, "等待线程", "等待可用 worker")
+            item_id = self.find_item_id_by_record(record)
+            if item_id:
+                self.root.after(
+                    0,
+                    self.update_tree_item,
+                    item_id,
+                    "扫描中...",
+                    record.title or "-",
+                    record.risk_level,
+                    self.build_running_result_text(record),
+                )
+            worker_record = self.copy_record_for_worker(record)
+            future = executor.submit(self.inspect_target_threadsafe, worker_record, screenshot_dir)
+            future_map[future] = record
+            return True
+
         try:
-            for record in pending_records:
-                if not self.is_scanning:
+            for _ in range(min(self.get_worker_count(), len(pending_records))):
+                if not submit_next_record():
                     break
-                self.clear_record_stage(record)
-                record.status = "扫描中..."
-                self.set_record_stage(record, "等待线程", "已进入分析队列")
-                item_id = self.find_item_id_by_record(record)
-                if item_id:
-                    self.root.after(0, self.update_tree_item, item_id, "扫描中...", record.title or "-", record.risk_level, self.build_running_result_text(record))
-                self.log_queue.put(f"[>] 正在分析: {record.target}")
-                future = executor.submit(self.inspect_target_threadsafe, record, screenshot_dir)
-                future_map[future] = record
 
             while future_map:
                 self.monitor_running_records(list(future_map.values()))
+                timed_out = []
+                for future, record in list(future_map.items()):
+                    if self.is_record_http_stage_timeout(record):
+                        timed_out.append((future, record, "HTTP请求超时，目标长时间无响应"))
+                    elif self.is_record_hard_timeout(record):
+                        timed_out.append((future, record, "单目标扫描超时"))
+                if timed_out:
+                    for future, record, reason in timed_out:
+                        future_map.pop(future, None)
+                        future.cancel()
+                        self.mark_record_scan_timeout(record, reason)
+                        item_id = self.find_item_id_by_record(record)
+                        if item_id:
+                            self.root.after(0, self.update_tree_item, item_id, record.status, record.title or "-", record.risk_level, record.result)
+                        self.log_record_trace(record, record.error, level="WARN")
+                        self.schedule_progress_snapshot(reason="record-timeout")
+                    if not future_map:
+                        restart_audit_executor()
+                    while self.is_scanning and pending_queue and len(future_map) < worker_count:
+                        submit_next_record()
+                    continue
                 done, _pending = concurrent.futures.wait(
                     future_map.keys(),
                     timeout=0.2,
@@ -4625,20 +4973,23 @@ a {{ color: #2563eb; text-decoration: none; }}
                     item_id = self.find_item_id_by_record(record)
                     try:
                         analyzed = future.result()
-                        self.clear_record_stage(analyzed)
+                        self.merge_record_from_worker(record, analyzed)
+                        self.clear_record_stage(record)
                         if item_id:
                             self.root.after(
                                 0,
                                 self.update_tree_item,
                                 item_id,
-                                analyzed.status,
-                                analyzed.title or "-",
-                                analyzed.risk_level,
-                                analyzed.result,
+                                record.status,
+                                record.title or "-",
+                                record.risk_level,
+                                record.result,
                             )
                         else:
                             self.root.after(0, self.apply_filter)
                         self.schedule_progress_snapshot(reason="record-updated")
+                        while self.is_scanning and pending_queue and len(future_map) < worker_count:
+                            submit_next_record()
                     except requests.exceptions.ProxyError:
                         self.clear_record_stage(record)
                         record.status = "已完成"
@@ -4659,12 +5010,19 @@ a {{ color: #2563eb; text-decoration: none; }}
                         result_summary, error_text = describe_request_exception(exc)
                         record.status = "已完成"
                         record.risk_level = "失败"
-                        record.result = result_summary
+                        proxy_summary = getattr(exc, "_proxy_summary", "")
+                        if proxy_summary:
+                            record.result = f"代理已连通，但目标响应异常: {result_summary}"
+                            error_text = f"{error_text} | proxy_stage={proxy_summary}"
+                        else:
+                            record.result = result_summary
                         record.error = error_text
                         if item_id:
                             self.root.after(0, self.update_tree_item, item_id, record.status, "-", record.risk_level, record.result)
                         self.log_queue.put(f"[-] {record.target} {result_summary}: {error_text}")
                         self.schedule_progress_snapshot(reason="record-error")
+                        while self.is_scanning and pending_queue and len(future_map) < worker_count:
+                            submit_next_record()
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
@@ -4681,12 +5039,17 @@ a {{ color: #2563eb; text-decoration: none; }}
         self.root.after(0, self.reset_scan_button)
 
     def inspect_target_threadsafe(self, record: AuditRecord, screenshot_dir: Path) -> AuditRecord:
-        candidates = self.get_proxy_candidates_for_record(record)
+        candidates = self.order_connection_candidates(record.target, self.get_proxy_candidates_for_record(record))
         last_exc = None
+        had_proxy_failure = False
+        last_proxy_summary = ""
+        record.route_strategy_used = self.get_proxy_strategy()
         for index, proxy_addr in enumerate(candidates, start=1):
             session = self.build_requests_session(proxy_addr)
             record.proxy_used = proxy_addr or ""
             try:
+                if proxy_addr is None and had_proxy_failure:
+                    self.log_queue.put(f"[~] {record.target} 代理链路异常，自动回退直连重试。")
                 self.set_record_stage(record, "建立连接", f"出口={record.proxy_used or '直连'}")
                 analyzed = self.inspect_target(session, record, screenshot_dir)
                 self.mark_proxy_success(proxy_addr or "")
@@ -4695,16 +5058,66 @@ a {{ color: #2563eb; text-decoration: none; }}
                 last_exc = exc
                 summary, _detail = describe_request_exception(exc)
                 self.mark_proxy_failure(proxy_addr or "", summary)
+                if proxy_addr:
+                    had_proxy_failure = True
+                    last_proxy_summary = summary
                 if self.should_retry_with_next_proxy(exc, index, len(candidates)):
                     target_proxy = proxy_addr or "直连"
+                    retry_target = candidates[index] if index < len(candidates) else None
+                    retry_label = retry_target or "直连"
                     self.log_queue.put(
-                        f"[~] {record.target} 代理出口失败，准备切换下一个代理: {target_proxy} -> {compact_exception_message(exc)}"
+                        f"[~] {record.target} 当前出口失败，准备切换: {target_proxy} -> {retry_label} | {compact_exception_message(exc)}"
                     )
                     continue
                 raise
         if last_exc:
+            if had_proxy_failure:
+                setattr(last_exc, "_proxy_summary", last_proxy_summary)
             raise last_exc
         raise RuntimeError("未获取到可用代理出口")
+
+    def run_bruteforce_for_record(self, record: AuditRecord, session: requests.Session, soup: BeautifulSoup):
+        if record.slider_captcha_present:
+            self.set_record_stage(record, "弱口令检测", "检测到滑块验证码，当前版本不支持自动完成")
+        else:
+            self.set_record_stage(record, "弱口令检测", "准备提交账号/密码组合")
+        self.log_queue.put(f"[*] 正在对 {record.target} 进行弱口令尝试...")
+        brute = BruteForceHandler(
+            session,
+            self.log_queue,
+            driver_factory=lambda proxy_addr=record.proxy_used: self.init_headless_driver(proxy_addr or None),
+            render_wait=self.get_render_wait(),
+            captcha_ocr_enabled=self.captcha_ocr_var.get(),
+            ocr_endpoint=self.ocr_endpoint_entry.get().strip(),
+            ocr_endpoint_resolver=self.resolve_ocr_endpoint_for_record,
+            locator_rule_resolver=self.resolve_locator_rule_for_record,
+            captcha_lock=self.captcha_brute_lock,
+            progress_callback=lambda detail, active_record=record: self.set_record_stage(
+                active_record,
+                "弱口令检测",
+                detail,
+                log_change=False,
+            ),
+        )
+        res = brute.run(
+            record,
+            dict_mode=self.dict_mode_var.get(),
+            user_dict_path=self.user_dict_entry.get().strip(),
+            pass_dict_path=self.pass_dict_entry.get().strip(),
+            soup=soup,
+        )
+        owner_record = getattr(record, "_scan_owner_record", None)
+        if owner_record is not None and owner_record.status == "已完成" and record.status == "扫描中...":
+            return record
+        record.result += f" | 弱口令检测: {res}"
+        if res.startswith(BRUTE_FORCE_SUCCESS_PREFIX):
+            record.risk_level = "高"
+            self.log_queue.put(f"[!] 发现弱口令风险: {record.target} -> {res}")
+        item_id = self.find_item_id_by_record(record)
+        if item_id:
+            self.root.after(0, self.update_tree_item, item_id, record.status, record.title or "-", record.risk_level, record.result)
+        self.schedule_progress_snapshot(reason="bruteforce-updated")
+        return record
 
     def analyze_record_from_html(self, record: AuditRecord, page_url: str, html_text: str) -> BeautifulSoup:
         soup = BeautifulSoup(html_text or "", "html.parser")
@@ -4781,9 +5194,9 @@ a {{ color: #2563eb; text-decoration: none; }}
         except Exception:
             return None
 
-        proxy_value = self.normalize_proxy_address(proxy_addr or "")
-        if not proxy_value and self.use_proxy_var.get() and self.proxy_mode_var.get() == PROXY_MODE_SINGLE:
-            proxy_value = self.normalize_proxy_address(self.proxy_entry.get())
+        proxy_value = self.get_browser_proxy_address(proxy_addr or "")
+        if not proxy_value and self.use_proxy_var.get():
+            proxy_value = self.get_browser_proxy_address(self.proxy_entry.get())
 
         common_args = [
             "--headless=new",
@@ -4822,7 +5235,12 @@ a {{ color: #2563eb; text-decoration: none; }}
                                 options.add_argument(f"--proxy-server={proxy_value}")
                             options.add_experimental_option("prefs", prefs)
                             options.add_experimental_option("excludeSwitches", ["enable-logging"])
-                            service = EdgeService(log_output=os.devnull, env=browser_env)
+                            service = EdgeService(
+                                log_output=os.devnull,
+                                service_args=["--silent"],
+                                env=browser_env,
+                                creationflags=self.get_subprocess_creationflags(),
+                            )
                             driver = webdriver.Edge(options=options, service=service)
                         else:
                             options = ChromeOptions()
@@ -4832,7 +5250,12 @@ a {{ color: #2563eb; text-decoration: none; }}
                                 options.add_argument(f"--proxy-server={proxy_value}")
                             options.add_experimental_option("prefs", prefs)
                             options.add_experimental_option("excludeSwitches", ["enable-logging"])
-                            service = ChromeService(log_output=os.devnull, env=browser_env)
+                            service = ChromeService(
+                                log_output=os.devnull,
+                                service_args=["--silent"],
+                                env=browser_env,
+                                creationflags=self.get_subprocess_creationflags(),
+                            )
                             driver = webdriver.Chrome(options=options, service=service)
                 driver.set_page_load_timeout(20)
                 return driver
@@ -4899,16 +5322,21 @@ a {{ color: #2563eb; text-decoration: none; }}
             )
             dom._active_record = active_record
             dom = dom.locate_login_dom(driver)
+            fallback_probe = {
+                "current_url": driver.current_url or url,
+                "html": driver.page_source or "",
+                "login_form": False,
+                "captcha_present": False,
+                "field_summary": "",
+                "form_method": "",
+                "probe_backend": "webdriver",
+            }
             if not dom or dom.get("pass") is None:
-                fallback_probe = {
-                    "current_url": driver.current_url or url,
-                    "html": driver.page_source or "",
-                    "login_form": False,
-                    "captcha_present": False,
-                    "field_summary": "",
-                    "form_method": "",
-                    "probe_backend": "webdriver",
-                }
+                if devtools_probe and not self.is_browser_error_url(fallback_probe["current_url"]):
+                    if self.is_browser_error_url(devtools_probe.get("current_url", "")):
+                        return fallback_probe
+                    if self.rank_browser_probe(fallback_probe) >= self.rank_browser_probe(devtools_probe):
+                        return fallback_probe
                 return devtools_probe or fallback_probe
 
             hints = []
@@ -4940,6 +5368,7 @@ a {{ color: #2563eb; text-decoration: none; }}
     def inspect_target(self, session: requests.Session, record: AuditRecord, screenshot_dir: Path) -> AuditRecord:
         current_url = record.target
         current_html = ""
+        record.http_error_status = 0
         self.set_record_stage(record, "HTTP请求", "拉取首页")
         response = session.get(
             record.target,
@@ -4947,19 +5376,20 @@ a {{ color: #2563eb; text-decoration: none; }}
             verify=False,
             allow_redirects=self.follow_redirect_var.get(),
         )
-        response.encoding = response.apparent_encoding or response.encoding
+        current_html, detected_encoding = self.choose_response_text(response)
         current_url = response.url
-        current_html = response.text or ""
-        self.set_record_stage(record, "静态分析", f"HTTP {response.status_code} | {response.url}")
-        soup = self.analyze_record_from_html(record, response.url, response.text)
+        self.set_record_stage(record, "静态分析", f"HTTP {response.status_code} | {response.url} | 编码={detected_encoding or '-'}")
+        soup = self.analyze_record_from_html(record, response.url, current_html)
         if response.status_code >= 400:
+            record.http_error_status = response.status_code
             record.result = f"{record.result} | HTTP {response.status_code}".strip(" |")
 
         actionable_login = self.is_actionable_login_record(record)
         browser_probe_needed = (
             self.browser_render_var.get()
+            and response.status_code < 400
             and not actionable_login
-            and (self.brute_var.get() or record.login_form or self.should_use_browser_render_fallback(record, response.text))
+            and (self.brute_var.get() or record.login_form or self.should_use_browser_render_fallback(record, current_html))
         )
         self.log_record_trace(
             record,
@@ -4982,8 +5412,11 @@ a {{ color: #2563eb; text-decoration: none; }}
                     f"field_summary={probed.get('field_summary') or '-'} | captcha={bool(probed.get('captcha_present'))} | "
                     f"route_attempts={', '.join(probed.get('route_attempts') or []) or '-'}",
                 )
+                probe_current_url = probed.get("current_url") or ""
+                if record.proxy_used and self.is_browser_error_url(probe_current_url):
+                    raise requests.exceptions.ProxyError(f"browser render failed under proxy: {probe_current_url}")
                 probe_signal = self.browser_probe_has_login_signal(probed)
-                rendered_url = probed.get("current_url") or record.final_url or record.target
+                rendered_url = probe_current_url or record.final_url or record.target
                 rendered_html = probed.get("html") or ""
                 current_url = rendered_url
                 current_html = rendered_html
@@ -5015,10 +5448,12 @@ a {{ color: #2563eb; text-decoration: none; }}
                 self.log_record_trace(record, "浏览器补扫失败 | 未获取到有效 probe 结果", level="WARN")
                 record.result = f"{record.result} | 浏览器补扫失败".strip(" |")
 
-        llm_should_run = self.uses_llm_primary() or (self.uses_llm_fallback() and self.should_fallback_to_llm(record))
+        llm_should_run = response.status_code < 400 and (
+            self.uses_llm_primary() or (self.uses_llm_fallback() and self.should_fallback_to_llm(record))
+        )
         if llm_should_run:
             self.set_record_stage(record, "大模型分析", "调用外部模型判断登录页")
-            llm_result = self.call_llm_for_page(record, current_url or record.final_url or record.target, current_html or response.text or "")
+            llm_result = self.call_llm_for_page(record, current_url or record.final_url or record.target, current_html or "")
             if llm_result is not None:
                 self.apply_llm_analysis_result(record, llm_result)
             else:
@@ -5026,7 +5461,9 @@ a {{ color: #2563eb; text-decoration: none; }}
                 record.result = f"{record.result} | 大模型分析失败: {reason}".strip(" |")
                 self.log_record_trace(record, f"大模型分析失败 | reason={reason}", level="WARN")
 
-        if self.brute_var.get() and not self.is_actionable_login_record(record):
+        if self.should_run_bruteforce_for_record(record):
+            self.run_bruteforce_for_record(record, session, soup)
+        elif self.brute_var.get() and not self.is_actionable_login_record(record):
             record.result = f"{record.result} | 未识别到可用登录框，未进入弱口令尝试".strip(" |")
 
         self.log_record_trace(
@@ -5037,36 +5474,7 @@ a {{ color: #2563eb; text-decoration: none; }}
         self.log_queue.put(
             f"[+] {record.target} 分析完成: 标题={record.title or '无标题'} 风险={record.risk_level}"
         )
-        if self.brute_var.get() and self.is_actionable_login_record(record):
-            if record.slider_captcha_present:
-                self.set_record_stage(record, "弱口令检测", "检测到滑块验证码，当前版本不支持自动完成")
-            else:
-                self.set_record_stage(record, "弱口令检测", "准备提交账号/密码组合")
-            self.log_queue.put(f"[*] 正在对 {record.target} 进行弱口令尝试...")
-            brute = BruteForceHandler(
-                session,
-                self.log_queue,
-                driver_factory=lambda proxy_addr=record.proxy_used: self.init_headless_driver(proxy_addr or None),
-                render_wait=self.get_render_wait(),
-                captcha_ocr_enabled=self.captcha_ocr_var.get(),
-                ocr_endpoint=self.ocr_endpoint_entry.get().strip(),
-                ocr_endpoint_resolver=self.resolve_ocr_endpoint_for_record,
-                locator_rule_resolver=self.resolve_locator_rule_for_record,
-                captcha_lock=self.captcha_brute_lock,
-            )
-            res = brute.run(
-                record,
-                dict_mode=self.dict_mode_var.get(),
-                user_dict_path=self.user_dict_entry.get().strip(),
-                pass_dict_path=self.pass_dict_entry.get().strip(),
-                soup=soup,
-            )
-            record.result += f" | 弱口令检测: {res}"
 
-            if res.startswith(BRUTE_FORCE_SUCCESS_PREFIX):
-                record.risk_level = "高"
-                self.log_queue.put(f"[!] 发现弱口令风险: {record.target} -> {res}")
-        
         return record
 
     def capture_stage(self, records: list[AuditRecord], screenshot_dir: Path, allow_when_stopped: bool = False):
@@ -5337,6 +5745,10 @@ a {{ color: #2563eb; text-decoration: none; }}
                 if token in {"登录", "登陆", "用户名", "密码", "admin", "login", "account", "password"}
             )
             score += min(weight, 4)
+            if forms and any(keyword.lower() in text_blob for keyword in CAPTCHA_KEYWORDS):
+                score += 1
+            if any(token in (title or "").lower() for token in ("login", "signin", "auth")):
+                score += 1
         return score
 
     def calculate_risk(self, record: AuditRecord) -> str:
@@ -5501,6 +5913,7 @@ a {{ color: #2563eb; text-decoration: none; }}
         window.bind("<Control-plus>", lambda _event: zoom(0.2))
         window.bind("<Control-minus>", lambda _event: zoom(-0.2))
         reset_zoom()
+
 
     def open_selected_target(self):
         record = self.get_selected_record()
@@ -5747,14 +6160,11 @@ a {{ color: #2563eb; text-decoration: none; }}
 
         top_bar = tk.Frame(window, pady=8, padx=12)
         top_bar.pack(fill=tk.X)
-        mode_text = self.proxy_mode_var.get() if self.use_proxy_var.get() else "未启用代理"
-        info_parts = [f"当前模式: {mode_text}"]
-        if self.use_proxy_var.get() and self.proxy_mode_var.get() == PROXY_MODE_POOL:
-            info_parts.append(f"代理池文件: {self.proxy_pool_entry.get().strip() or '-'}")
-            info_parts.append(f"熔断阈值: {self.get_proxy_fail_threshold()} 次")
-            info_parts.append(f"冷却: {self.get_proxy_cooldown_seconds()}s")
-        elif self.use_proxy_var.get():
-            info_parts.append(f"代理地址: {self.normalize_proxy_address(self.proxy_entry.get()) or '-'}")
+        proxy_value = self.normalize_proxy_address(self.proxy_entry.get()) if self.use_proxy_var.get() else ""
+        info_parts = [f"当前模式: {'单代理' if self.use_proxy_var.get() else '未启用代理'}"]
+        info_parts.append(f"连接策略: {self.describe_proxy_strategy() if self.use_proxy_var.get() else '仅直连'}")
+        info_parts.append(f"代理协议: {self.get_proxy_scheme_name() if self.use_proxy_var.get() else '-'}")
+        info_parts.append(f"代理地址: {proxy_value or '-'}")
         info_var = tk.StringVar(value=" | ".join(info_parts))
         tk.Label(top_bar, textvariable=info_var, anchor="w", justify=tk.LEFT, wraplength=820).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -5762,19 +6172,18 @@ a {{ color: #2563eb; text-decoration: none; }}
         table_frame.pack(fill=tk.BOTH, expand=True)
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
-        columns = ("代理", "状态", "失败次数", "剩余冷却", "分配目标", "最后成功", "最近错误")
+        columns = ("代理", "协议", "状态", "失败次数", "最后成功", "最近错误")
         tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=18)
         y_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
         x_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
 
         self.configure_tree_columns(tree, [
-            ("代理", 220, tk.W),
-            ("状态", 76, tk.CENTER),
+            ("代理", 240, tk.W),
+            ("协议", 90, tk.CENTER),
+            ("状态", 90, tk.CENTER),
             ("失败次数", 80, tk.CENTER),
-            ("剩余冷却", 90, tk.CENTER),
-            ("分配目标", 80, tk.CENTER),
-            ("最后成功", 90, tk.CENTER),
+            ("最后成功", 100, tk.CENTER),
             ("最近错误", 360, tk.W),
         ])
 
@@ -5784,48 +6193,27 @@ a {{ color: #2563eb; text-decoration: none; }}
 
         status_var = tk.StringVar(value="")
         tk.Label(window, textvariable=status_var, anchor="w", padx=12, pady=6, fg="#475569").pack(fill=tk.X)
+        rows = self.get_proxy_status_rows()
+        if not rows:
+            status_var.set("当前没有可展示的代理状态。")
+            return
 
-        def populate():
-            for item in tree.get_children():
-                tree.delete(item)
-            rows = self.get_proxy_status_rows()
-            if not rows:
-                status_var.set("当前没有可展示的代理状态。")
-                return
-            for row in rows:
-                tags = ("cooldown",) if row["status"] == "冷却中" else ("healthy",)
-                tree.insert(
-                    "",
-                    tk.END,
-                    values=(
-                        row["proxy"],
-                        row["status"],
-                        row["fail_count"],
-                        row["cooldown"],
-                        row["assigned"],
-                        row["last_ok"],
-                        row["last_error"],
-                    ),
-                    tags=tags,
-                )
-            healthy_count = sum(1 for row in rows if row["status"] == "可用")
-            cooldown_count = len(rows) - healthy_count
-            status_var.set(f"代理总数 {len(rows)} | 可用 {healthy_count} | 冷却中 {cooldown_count}")
+        for row in rows:
+            tree.insert(
+                "",
+                tk.END,
+                values=(
+                    row["proxy"],
+                    row.get("scheme", "-"),
+                    row["status"],
+                    row["fail_count"],
+                    row["last_ok"],
+                    row["last_error"],
+                ),
+            )
 
-        tree.tag_configure("healthy", background="#edf9ed")
-        tree.tag_configure("cooldown", background="#fff0cf")
-        populate()
+        status_var.set(f"代理总数 {len(rows)} | 最近失败 {sum(1 for row in rows if row['status'] == '最近失败')}")
 
-        button_bar = tk.Frame(window, pady=8, padx=12)
-        button_bar.pack(fill=tk.X)
-        tk.Button(button_bar, text="刷新", command=populate).pack(side=tk.LEFT)
-        tk.Button(button_bar, text="重置健康状态", command=lambda: reset_proxy_health()).pack(side=tk.LEFT, padx=(6, 0))
-        tk.Button(button_bar, text="关闭", command=window.destroy).pack(side=tk.RIGHT)
-
-        def reset_proxy_health():
-            self.proxy_health.clear()
-            self.log_message("[*] 已清空代理健康状态与熔断计数。")
-            populate()
 
     def populate_profile_tab(self, frame, rows: list[dict], first_col_name: str):
         table_frame = tk.Frame(frame, padx=12, pady=12)
@@ -6027,6 +6415,7 @@ a {{ color: #2563eb; text-decoration: none; }}
             f"目标: {record.target}",
             f"最终URL: {record.final_url or '-'}",
             f"代理: {record.proxy_used or '直连'}",
+            f"策略: {record.route_strategy_used or '-'}",
             f"OCR: {record.ocr_endpoint_used or '-'}",
             f"阶段: {record.analysis_stage or '-'}",
             f"AI: {self.get_llm_summary_display(record)}",
@@ -6065,11 +6454,24 @@ a {{ color: #2563eb; text-decoration: none; }}
         items = [part.strip() for part in (text or "").split(" | ") if part.strip()]
         return items or ["-"]
 
+    def get_bruteforce_status_text(self, record: AuditRecord) -> str:
+        for item in self.split_pipe_items(record.result):
+            if item.startswith("弱口令检测:"):
+                return item.split(":", 1)[1].strip() or "-"
+        if record.analysis_stage == "弱口令检测":
+            return f"进行中 | {record.analysis_detail or '-'}"
+        if "未进入弱口令尝试" in (record.result or ""):
+            return "未进入尝试"
+        if not self.brute_var.get():
+            return "未启用"
+        return "-"
+
     def build_record_detail_text(self, record: AuditRecord) -> str:
         lines = [
             f"当前阶段: {record.analysis_stage or '-'}",
             f"阶段详情: {record.analysis_detail or '-'}",
             f"分析耗时: {self.format_elapsed_seconds(time.time() - record.analysis_started_ts) if record.analysis_started_ts else '-'}",
+            f"弱口令状态: {self.get_bruteforce_status_text(record)}",
             f"大模型结论: {record.llm_decision or '-'}",
             f"大模型摘要: {record.llm_summary or '-'}",
             f"大模型置信度: {record.llm_confidence:.2f}" if record.llm_decision else "大模型置信度: -",
@@ -6077,6 +6479,7 @@ a {{ color: #2563eb; text-decoration: none; }}
             f"表单方法: {record.form_method or '-'}",
             f"表单Action: {record.form_action or '-'}",
             f"代理出口: {record.proxy_used or '直连'}",
+            f"连接策略: {record.route_strategy_used or '-'}",
             f"OCR接口: {record.ocr_endpoint_used or '-'}",
             f"OCR规则: {record.ocr_route_rule or '-'}",
             f"定位规则: {record.locator_rule_used or '-'}",
@@ -6217,6 +6620,65 @@ a {{ color: #2563eb; text-decoration: none; }}
         self.toggle_proxy_state()
         self.schedule_progress_snapshot(reason="ui-reset")
 
+    def queue_bruteforce_for_record(self, record: AuditRecord, session: requests.Session, soup: BeautifulSoup):
+        if not self.should_run_bruteforce_for_record(record):
+            return None
+        task = (record, session, soup)
+        self.brute_task_queue.append(task)
+        self.ensure_brute_executor()
+        self.schedule_brute_dispatch()
+        return task
+
+    def ensure_brute_executor(self):
+        if self.brute_executor is not None:
+            return
+        self.brute_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.get_brute_worker_count(),
+            thread_name_prefix="brute",
+        )
+
+    def schedule_brute_dispatch(self):
+        self.root.after(0, self.dispatch_brute_tasks)
+
+    def dispatch_brute_tasks(self):
+        executor = self.brute_executor
+        if executor is None:
+            return
+        while self.brute_task_queue and len(self.brute_future_map) < self.get_brute_worker_count():
+            record, session, soup = self.brute_task_queue.popleft()
+            future = executor.submit(self.run_bruteforce_for_record, record, session, soup)
+            self.brute_future_map[future] = record
+        if self.brute_task_queue or self.brute_future_map:
+            self.root.after(500, self.poll_brute_tasks)
+
+    def poll_brute_tasks(self):
+        if not self.brute_future_map:
+            if not self.brute_task_queue:
+                self.shutdown_brute_executor()
+            return
+        done, _pending = concurrent.futures.wait(
+            self.brute_future_map.keys(),
+            timeout=0.2,
+            return_when=concurrent.futures.FIRST_COMPLETED,
+        )
+        for future in done:
+            record = self.brute_future_map.pop(future)
+            try:
+                future.result()
+            except Exception as exc:
+                self.log_queue.put(f"[~] {record.target} 弱口令阶段异常: {compact_exception_message(exc)}")
+        if self.brute_task_queue:
+            self.dispatch_brute_tasks()
+        if self.brute_future_map:
+            self.root.after(500, self.poll_brute_tasks)
+
+    def shutdown_brute_executor(self):
+        executor = self.brute_executor
+        self.brute_executor = None
+        self.brute_future_map.clear()
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
     def get_records_snapshot(self) -> list[AuditRecord]:
         with self.result_lock:
             return list(self.filtered_records())
@@ -6235,10 +6697,9 @@ a {{ color: #2563eb; text-decoration: none; }}
                 "use_proxy": self.use_proxy_var.get(),
                 "proxy": self.proxy_entry.get().strip(),
                 "proxy_mode": self.proxy_mode_var.get(),
-                "proxy_pool_path": self.proxy_pool_entry.get().strip(),
-                "proxy_retry": self.proxy_retry_var.get(),
-                "proxy_fail_threshold": self.proxy_fail_threshold_var.get(),
-                "proxy_cooldown": self.proxy_cooldown_var.get(),
+                "proxy_strategy": self.get_proxy_strategy(),
+                "proxy_scheme": self.get_proxy_scheme_name(),
+                "proxy_precheck_count": self.proxy_precheck_var.get(),
                 "capture": self.capture_var.get(),
                 "capture_policy": self.capture_policy_var.get(),
                 "capture_delay": self.capture_delay_var.get(),
@@ -6331,13 +6792,12 @@ a {{ color: #2563eb; text-decoration: none; }}
         self.proxy_entry.config(state=tk.NORMAL)
         self.proxy_entry.delete(0, tk.END)
         self.proxy_entry.insert(0, payload.get("proxy", "127.0.0.1:8080"))
-        self.proxy_mode_var.set(payload.get("proxy_mode", PROXY_MODE_SINGLE))
-        self.proxy_pool_entry.config(state=tk.NORMAL)
-        self.proxy_pool_entry.delete(0, tk.END)
-        self.proxy_pool_entry.insert(0, payload.get("proxy_pool_path", ""))
-        self.proxy_retry_var.set(str(payload.get("proxy_retry", "2")))
-        self.proxy_fail_threshold_var.set(str(payload.get("proxy_fail_threshold", "2")))
-        self.proxy_cooldown_var.set(str(payload.get("proxy_cooldown", "120")))
+        self.proxy_mode_var.set(PROXY_MODE_SINGLE)
+        saved_proxy_strategy = payload.get("proxy_strategy", PROXY_STRATEGY_DIRECT_FIRST)
+        self.proxy_strategy_var.set(saved_proxy_strategy if saved_proxy_strategy in PROXY_STRATEGY_OPTIONS else PROXY_STRATEGY_DIRECT_FIRST)
+        saved_proxy_scheme = payload.get("proxy_scheme", self.infer_proxy_scheme_label(payload.get("proxy", "")))
+        self.proxy_scheme_var.set(saved_proxy_scheme if saved_proxy_scheme in PROXY_SCHEME_OPTIONS else PROXY_SCHEME_HTTP)
+        self.proxy_precheck_var.set(str(payload.get("proxy_precheck_count", DEFAULT_PRECHECK_COUNT)))
         self.capture_var.set(bool(payload.get("capture", True)))
         saved_capture_policy = payload.get("capture_policy", CAPTURE_POLICY_LOGIN)
         self.capture_policy_var.set(saved_capture_policy if saved_capture_policy in CAPTURE_POLICY_OPTIONS else CAPTURE_POLICY_LOGIN)

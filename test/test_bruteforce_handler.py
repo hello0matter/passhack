@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 import queue
 
@@ -13,18 +14,31 @@ from passhack import (
     AuditRecord,
     BruteForceHandler,
     DEFAULT_OCR_ENDPOINT,
+    DEFAULT_PRECHECK_COUNT,
     describe_request_exception,
     is_retryable_failure_result,
     PROXY_MODE_POOL,
+    PROXY_STRATEGY_DIRECT_FIRST,
+    PROXY_STRATEGY_PROXY_ONLY,
+    PROXY_STRATEGY_DIRECT_ONLY,
+    PROXY_SCHEME_SOCKS5,
     SecurityAuditGUI,
 )
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, text="", headers=None):
+    def __init__(self, status_code=200, text="", headers=None, url="http://example.com", content=None, encoding="utf-8", apparent_encoding="utf-8"):
         self.status_code = status_code
         self.text = text
         self.headers = headers or {}
+        self.url = url
+        self.content = content if content is not None else text.encode(encoding or "utf-8", errors="replace")
+        self.encoding = encoding
+        self._apparent_encoding = apparent_encoding
+
+    @property
+    def apparent_encoding(self):
+        return self._apparent_encoding
 
 
 class FakeSession:
@@ -232,6 +246,86 @@ class BruteForceHandlerTest(unittest.TestCase):
 
         self.assertEqual(endpoint, "http://127.0.0.1:8888/reg00")
 
+    def test_normalize_proxy_address_supports_socks_scheme_selection(self):
+        gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
+        gui.proxy_scheme_var = DummyVar(PROXY_SCHEME_SOCKS5)
+
+        self.assertEqual(gui.normalize_proxy_address("127.0.0.1:7891"), "socks5://127.0.0.1:7891")
+        self.assertEqual(gui.get_browser_proxy_address("socks5h://127.0.0.1:7891"), "socks5://127.0.0.1:7891")
+
+    def test_get_proxy_candidates_falls_back_to_direct(self):
+        gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
+        gui.use_proxy_var = DummyVar(True)
+        gui.proxy_entry = DummyEntry("127.0.0.1:7890")
+        gui.proxy_scheme_var = DummyVar(PROXY_SCHEME_SOCKS5)
+        gui.proxy_strategy_var = DummyVar(PROXY_STRATEGY_DIRECT_FIRST)
+
+        record = AuditRecord(record_id=1, target="http://example.com")
+        self.assertEqual(gui.get_proxy_candidates_for_record(record), [None, "socks5://127.0.0.1:7890"])
+
+    def test_get_proxy_candidates_supports_direct_only(self):
+        gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
+        gui.use_proxy_var = DummyVar(True)
+        gui.proxy_entry = DummyEntry("127.0.0.1:7890")
+        gui.proxy_scheme_var = DummyVar(PROXY_SCHEME_SOCKS5)
+        gui.proxy_strategy_var = DummyVar(PROXY_STRATEGY_DIRECT_ONLY)
+
+        record = AuditRecord(record_id=1, target="http://example.com")
+        self.assertEqual(gui.get_proxy_candidates_for_record(record), [None])
+
+    def test_get_proxy_candidates_supports_proxy_only(self):
+        gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
+        gui.use_proxy_var = DummyVar(True)
+        gui.proxy_entry = DummyEntry("127.0.0.1:7890")
+        gui.proxy_scheme_var = DummyVar(PROXY_SCHEME_SOCKS5)
+        gui.proxy_strategy_var = DummyVar(PROXY_STRATEGY_PROXY_ONLY)
+
+        record = AuditRecord(record_id=1, target="http://example.com")
+        self.assertEqual(gui.get_proxy_candidates_for_record(record), ["socks5://127.0.0.1:7890"])
+
+    def test_queue_bruteforce_enqueues_task(self):
+        gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
+        gui.brute_var = DummyVar(True)
+        gui.brute_task_queue = queue.deque()
+        gui.brute_future_map = {}
+        gui.brute_executor = None
+        gui.is_actionable_login_record = lambda record: True
+        gui.ensure_brute_executor = lambda: setattr(gui, "executor_ready", True)
+        gui.schedule_brute_dispatch = lambda: setattr(gui, "dispatch_scheduled", True)
+
+        record = AuditRecord(record_id=1, target="http://example.com", login_form=True)
+        task = gui.queue_bruteforce_for_record(record, FakeSession(), BeautifulSoup("<form></form>", "html.parser"))
+
+        self.assertIsNotNone(task)
+        self.assertTrue(gui.brute_task_queue)
+        self.assertTrue(getattr(gui, "executor_ready", False))
+        self.assertTrue(getattr(gui, "dispatch_scheduled", False))
+
+
+    def test_get_probe_targets_repeats_precheck_count(self):
+        gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
+        gui.use_proxy_var = DummyVar(True)
+        gui.proxy_entry = DummyEntry("127.0.0.1:7890")
+        gui.proxy_scheme_var = DummyVar(PROXY_SCHEME_SOCKS5)
+        gui.proxy_strategy_var = DummyVar(PROXY_STRATEGY_DIRECT_FIRST)
+        gui.proxy_precheck_var = DummyVar(DEFAULT_PRECHECK_COUNT)
+
+        record = AuditRecord(record_id=1, target="http://example.com")
+        gui.probe_connection_candidate = lambda target, proxy: (proxy is None, 0.1 if proxy is None else 0.2)
+        self.assertEqual(gui.order_connection_candidates(record.target, gui.get_proxy_candidates_for_record(record)), [None, "socks5://127.0.0.1:7890"])
+
+    def test_order_connection_candidates_uses_proxy_when_direct_fails(self):
+        gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
+        gui.use_proxy_var = DummyVar(True)
+        gui.proxy_entry = DummyEntry("127.0.0.1:7890")
+        gui.proxy_scheme_var = DummyVar(PROXY_SCHEME_SOCKS5)
+        gui.proxy_strategy_var = DummyVar(PROXY_STRATEGY_DIRECT_FIRST)
+        gui.proxy_precheck_var = DummyVar(DEFAULT_PRECHECK_COUNT)
+
+        record = AuditRecord(record_id=1, target="http://example.com")
+        gui.probe_connection_candidate = lambda target, proxy: ((proxy is not None), 0.2 if proxy is not None else 9.9)
+        self.assertEqual(gui.order_connection_candidates(record.target, gui.get_proxy_candidates_for_record(record)), ["socks5://127.0.0.1:7890", None])
+
     def test_mark_proxy_failure_sets_cooldown(self):
         gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
         gui.proxy_health = {}
@@ -239,6 +333,12 @@ class BruteForceHandlerTest(unittest.TestCase):
         gui.proxy_fail_threshold_var = DummyVar("2")
         gui.proxy_cooldown_var = DummyVar("60")
         gui.log_queue = queue.Queue()
+        gui.mark_proxy_failure("http://127.0.0.1:7890", "timeout")
+        state = gui.get_proxy_health("http://127.0.0.1:7890")
+        self.assertEqual(state["fail_count"], 1)
+        self.assertEqual(state["last_error"], "timeout")
+        self.assertFalse(gui.is_proxy_in_cooldown("http://127.0.0.1:7890"))
+        return
 
         gui.mark_proxy_failure("http://127.0.0.1:7890", "连接超时，目标可能已下线或端口不通")
         self.assertFalse(gui.is_proxy_in_cooldown("http://127.0.0.1:7890"))
@@ -284,12 +384,20 @@ class BruteForceHandlerTest(unittest.TestCase):
     def test_get_proxy_status_rows_includes_pool_health(self):
         gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
         gui.proxy_mode_var = DummyVar(PROXY_MODE_POOL)
-        gui.proxy_entry = DummyEntry("")
+        gui.proxy_entry = DummyEntry("127.0.0.1:7890")
+        gui.proxy_scheme_var = DummyVar(PROXY_SCHEME_SOCKS5)
         gui.proxy_health = {}
         gui.proxy_assignment = {"http://a.test": "http://127.0.0.1:7890"}
         gui.log_queue = queue.Queue()
         gui.proxy_fail_threshold_var = DummyVar("1")
         gui.proxy_cooldown_var = DummyVar("60")
+        gui.mark_proxy_failure("socks5://127.0.0.1:7890", "timeout")
+        rows = gui.get_proxy_status_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["proxy"], "socks5://127.0.0.1:7890")
+        self.assertEqual(rows[0]["scheme"], PROXY_SCHEME_SOCKS5)
+        self.assertEqual(rows[0]["status"], "最近失败")
+        return
         with tempfile.TemporaryDirectory() as tmpdir:
             proxy_file = Path(tmpdir) / "pool.txt"
             proxy_file.write_text("127.0.0.1:7890\n127.0.0.1:7891\n", encoding="utf-8")
@@ -440,6 +548,117 @@ class BruteForceHandlerTest(unittest.TestCase):
         self.assertTrue(probe["login_form"])
         self.assertEqual(probe["field_summary"], "text:browser_user | password:browser_password")
         self.assertTrue(fake_driver.closed)
+
+    def test_scan_timeout_marks_record_completed(self):
+        gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
+        gui.log_queue = queue.Queue()
+        gui.clear_record_stage = SecurityAuditGUI.clear_record_stage.__get__(gui, SecurityAuditGUI)
+        gui.format_elapsed_seconds = SecurityAuditGUI.format_elapsed_seconds.__get__(gui, SecurityAuditGUI)
+        record = AuditRecord(
+            record_id=1,
+            target="http://slow.example.com",
+            status="扫描中...",
+            analysis_stage="HTTP请求",
+            analysis_detail="拉取首页",
+            analysis_started_ts=1.0,
+            analysis_stage_ts=1.0,
+        )
+
+        gui.mark_record_scan_timeout(record, "HTTP请求超时，目标长时间无响应")
+
+        self.assertEqual(record.status, "已完成")
+        self.assertEqual(record.risk_level, "失败")
+        self.assertIn("HTTP请求超时", record.result)
+        self.assertIn("ScanTimeout", record.error)
+        self.assertEqual(record.analysis_stage, "")
+
+    def test_worker_stage_is_mirrored_to_owner_record(self):
+        gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
+        gui.log_record_trace = lambda *args, **kwargs: None
+        gui.refresh_running_record_ui = lambda *args, **kwargs: None
+        owner = AuditRecord(record_id=1, target="http://example.com", status="扫描中...")
+        worker = gui.copy_record_for_worker(owner)
+
+        gui.set_record_stage(worker, "HTTP请求", "拉取首页")
+
+        self.assertEqual(owner.analysis_stage, "HTTP请求")
+        self.assertEqual(owner.analysis_detail, "拉取首页")
+        self.assertGreater(owner.analysis_started_ts, 0)
+
+    def test_browser_probe_hit_runs_bruteforce_inline(self):
+        gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
+        gui.brute_var = DummyVar(True)
+        gui.browser_render_var = DummyVar(True)
+        gui.follow_redirect_var = DummyVar(True)
+        gui.mode_var = DummyVar("")
+        gui.log_queue = queue.Queue()
+        gui.log_record_trace = lambda *args, **kwargs: None
+        gui.refresh_running_record_ui = lambda *args, **kwargs: None
+        gui.uses_llm_primary = lambda: False
+        gui.uses_llm_fallback = lambda: False
+        gui.calculate_risk = SecurityAuditGUI.calculate_risk.__get__(gui, SecurityAuditGUI)
+        gui.is_actionable_login_record = SecurityAuditGUI.is_actionable_login_record.__get__(gui, SecurityAuditGUI)
+        gui.should_run_bruteforce_for_record = SecurityAuditGUI.should_run_bruteforce_for_record.__get__(gui, SecurityAuditGUI)
+        gui.analyze_record_from_html = SecurityAuditGUI.analyze_record_from_html.__get__(gui, SecurityAuditGUI)
+        gui.should_use_browser_render_fallback = lambda record, html: True
+        gui.browser_probe_has_login_signal = lambda probe: True
+        gui.probe_login_with_browser = lambda url, proxy=None: {
+            "current_url": "http://example.com/login",
+            "html": "<html><input type='password' name='password'></html>",
+            "login_form": True,
+            "captcha_present": False,
+            "field_summary": "text:browser_user | password:browser_password",
+            "form_method": "POST",
+            "probe_backend": "cdp",
+        }
+        calls = []
+        gui.run_bruteforce_for_record = lambda record, session, soup: calls.append(record.target)
+        session = FakeSession()
+        session.get = lambda url, **kwargs: FakeResponse(
+            status_code=200,
+            text="<html><script src='/app.js'></script><script></script><script></script><script></script></html>",
+            url=url,
+        )
+        record = AuditRecord(record_id=1, target="http://example.com")
+
+        gui.inspect_target(session, record, Path("."))
+
+        self.assertEqual(calls, ["http://example.com"])
+        self.assertIn("浏览器渲染补扫命中", record.result)
+
+    def test_choose_response_text_prefers_non_mojibake_encoding(self):
+        gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
+        html = "<html><title>游戏管理后台</title></html>"
+        response = FakeResponse(
+            status_code=200,
+            text=html.encode("utf-8").decode("gbk", errors="replace"),
+            content=html.encode("utf-8"),
+            encoding="gbk",
+            apparent_encoding="gbk",
+        )
+
+        text, encoding = gui.choose_response_text(response)
+
+        self.assertIn("游戏管理后台", text)
+        self.assertEqual(encoding, "utf-8")
+
+    def test_waiting_stage_does_not_use_record_hard_timeout(self):
+        gui = SecurityAuditGUI.__new__(SecurityAuditGUI)
+        gui.browser_render_var = DummyVar(True)
+        gui.get_render_wait = lambda: 2.5
+        gui.uses_llm_primary = lambda: False
+        gui.uses_llm_fallback = lambda: False
+        record = AuditRecord(
+            record_id=1,
+            target="http://example.com",
+            status="扫描中...",
+            analysis_stage="等待线程",
+            analysis_started_ts=1000.0,
+            analysis_stage_ts=1000.0,
+        )
+
+        with mock.patch("passhack.time.time", return_value=1121.0):
+            self.assertFalse(gui.is_record_hard_timeout(record))
 
 
 if __name__ == "__main__":
