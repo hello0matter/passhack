@@ -572,7 +572,7 @@ class BruteForceHandler:
                     payload[pass_key] = p
                     resp = self.submit_login(action_url, method, payload, referer)
                     if self.is_successful_login(resp, action_url):
-                        return f"{BRUTE_FORCE_SUCCESS_PREFIX} {u}/{p}"
+                        return f"{BRUTE_FORCE_SUCCESS_PREFIX} 账号={self.redact_username(u)}，密码已隐藏"
                 except requests.RequestException:
                     continue
         return f"未命中弱口令(已尝试 {attempt_count} 组, {dict_label})"
@@ -580,6 +580,13 @@ class BruteForceHandler:
     def log(self, message: str):
         if self.log_queue is not None:
             self.log_queue.put(message)
+
+    @staticmethod
+    def redact_username(value: str) -> str:
+        rendered = str(value or "")
+        if len(rendered) <= 2:
+            return "*" * len(rendered)
+        return f"{rendered[0]}{'*' * (len(rendered) - 2)}{rendered[-1]}"
 
     def has_actionable_login_fields(self, record) -> bool:
         summary = (getattr(record, "field_summary", "") or "").lower()
@@ -694,7 +701,7 @@ class BruteForceHandler:
 
                             time.sleep(1.0)
                             if self.is_successful_browser_login(driver, login_url):
-                                return f"{BRUTE_FORCE_SUCCESS_PREFIX} {username}/{password}"
+                                return f"{BRUTE_FORCE_SUCCESS_PREFIX} 账号={self.redact_username(username)}，密码已隐藏"
                         except Exception:
                             continue
                 return f"未命中弱口令(已尝试 {attempt_count} 组, {dict_label}, 浏览器模式)"
