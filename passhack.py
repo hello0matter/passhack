@@ -1351,6 +1351,7 @@ class SecurityAuditGUI:
         self.builtin_user_dict_path = self.dicts_dir / "builtin_usernames.txt"
         self.builtin_pass_dict_path = self.dicts_dir / "builtin_passwords.txt"
         self.latest_project_path = self.state_dir / "latest_project.json"
+        self.sttool_defaults_path = self.state_dir / "sttool_defaults.json"
         self.current_project_path = None
         self.current_run_dir = None
         self.detail_log_path = None
@@ -1378,6 +1379,7 @@ class SecurityAuditGUI:
         self.ensure_builtin_dict_files()
         self.setup_theme()
         self.setup_ui()
+        self.load_sttool_defaults()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.check_log_queue()
         self.load_autosave_if_exists()
@@ -2948,6 +2950,34 @@ JSON.stringify((() => {
         self.open_builtin_dict_button.grid(row=0, column=4, sticky="w", padx=(8, 0))
         self.make_label(brute_row2, text="默认模式会直接使用内置常用账号/密码字典。", muted=True).grid(row=0, column=5, sticky="w", padx=(12, 0))
 
+        sttool_row = tk.Frame(brute_frame, bg=brute_frame.cget("bg"))
+        sttool_row.pack(fill=tk.X, pady=(8, 0))
+        self.sttool_max_attempts_var = tk.StringVar(value="10")
+        self.sttool_requests_per_minute_var = tk.StringVar(value="10")
+        self.sttool_concurrency_var = tk.StringVar(value="1")
+        self.sttool_stop_on_defense_var = tk.BooleanVar(value=True)
+        self.make_label(sttool_row, text="STTool ???????:").pack(side=tk.LEFT)
+        self.make_entry(sttool_row, textvariable=self.sttool_max_attempts_var, width=6).pack(side=tk.LEFT, padx=(4, 12))
+        self.make_label(sttool_row, text="?????:").pack(side=tk.LEFT)
+        self.make_entry(sttool_row, textvariable=self.sttool_requests_per_minute_var, width=6).pack(side=tk.LEFT, padx=(4, 12))
+        self.make_label(sttool_row, text="??:").pack(side=tk.LEFT)
+        self.make_entry(sttool_row, textvariable=self.sttool_concurrency_var, width=5).pack(side=tk.LEFT, padx=(4, 12))
+        self.make_checkbutton(
+            sttool_row,
+            text="??????????????",
+            variable=self.sttool_stop_on_defense_var,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        self.make_button(
+            sttool_row,
+            text="??? STTool ????",
+            command=self.save_sttool_defaults,
+            tone="primary",
+        ).pack(side=tk.LEFT)
+        self.make_label(
+            brute_frame,
+            text="STTool ????????????????????????????",
+            muted=True,
+        ).pack(anchor="w", pady=(6, 0))
         self.toggle_brute_dict_state()
 
         render_frame = self.make_section(render_tab, "浏览器补扫 / OCR / 定位规则")
@@ -3869,6 +3899,86 @@ JSON.stringify((() => {
         self.pass_dict_button.config(state=button_state)
         self.load_builtin_dict_button.config(state=button_state)
         self.open_builtin_dict_button.config(state=tk.NORMAL)
+
+    @staticmethod
+    def _positive_int(value, default, minimum=1, maximum=1000):
+        try:
+            parsed = int(str(value).strip())
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, min(parsed, maximum))
+
+    def sttool_default_settings(self):
+        custom_mode = self.dict_mode_var.get() == CUSTOM_BRUTE_DICT_MODE
+        return {
+            "schema_version": 1,
+            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "brute_enabled": bool(self.brute_var.get()),
+            "username_wordlist_path": self.user_dict_entry.get().strip() if custom_mode else "",
+            "wordlist_path": self.pass_dict_entry.get().strip() if custom_mode else "",
+            "max_attempts": self._positive_int(self.sttool_max_attempts_var.get(), 10),
+            "requests_per_minute": self._positive_int(
+                self.sttool_requests_per_minute_var.get(), 10, maximum=600
+            ),
+            "concurrency": self._positive_int(
+                self.sttool_concurrency_var.get(), 1, maximum=20
+            ),
+            "stop_on_defense": bool(self.sttool_stop_on_defense_var.get()),
+        }
+
+    def save_sttool_defaults(self, show_message=True):
+        payload = self.sttool_default_settings()
+        try:
+            temporary = self.sttool_defaults_path.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.sttool_defaults_path)
+        except OSError as exc:
+            if show_message:
+                messagebox.showerror("????", f"???? STTool ?????{exc}")
+            return False
+        if show_message:
+            messagebox.showinfo(
+                "???",
+                "STTool ?????????? PassHack ??????????????",
+            )
+        return True
+
+    def load_sttool_defaults(self):
+        if not self.sttool_defaults_path.is_file():
+            return
+        try:
+            payload = json.loads(self.sttool_defaults_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        self.brute_var.set(bool(payload.get("brute_enabled", self.brute_var.get())))
+        username_path = str(payload.get("username_wordlist_path") or "")
+        password_path = str(payload.get("wordlist_path") or "")
+        if username_path or password_path:
+            self.dict_mode_var.set(CUSTOM_BRUTE_DICT_MODE)
+            self.user_dict_entry.config(state=tk.NORMAL)
+            self.user_dict_entry.delete(0, tk.END)
+            self.user_dict_entry.insert(0, username_path)
+            self.pass_dict_entry.config(state=tk.NORMAL)
+            self.pass_dict_entry.delete(0, tk.END)
+            self.pass_dict_entry.insert(0, password_path)
+        self.sttool_max_attempts_var.set(
+            str(self._positive_int(payload.get("max_attempts"), 10))
+        )
+        self.sttool_requests_per_minute_var.set(
+            str(self._positive_int(payload.get("requests_per_minute"), 10, maximum=600))
+        )
+        self.sttool_concurrency_var.set(
+            str(self._positive_int(payload.get("concurrency"), 1, maximum=20))
+        )
+        self.sttool_stop_on_defense_var.set(
+            bool(payload.get("stop_on_defense", True))
+        )
+        self.toggle_brute_dict_state()
 
     def browse_user_dict(self):
         path = filedialog.askopenfilename(
@@ -4810,6 +4920,7 @@ a {{ color: #2563eb; text-decoration: none; }}
             if proxy_error:
                 messagebox.showwarning("提示", proxy_error)
                 return
+            self.save_sttool_defaults(show_message=False)
             self.is_scanning = True
             self.btn_start.config(text="停止审计", bg="#ff8d7b")
             self.btn_retry_failed.config(state=tk.DISABLED)

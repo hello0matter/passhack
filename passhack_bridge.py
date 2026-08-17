@@ -68,6 +68,61 @@ def read_json(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+DEFAULT_STTOOL_POLICY = {
+    "brute_enabled": True,
+    "username_wordlist_path": "",
+    "wordlist_path": "",
+    "max_attempts": 10,
+    "requests_per_minute": 10,
+    "concurrency": 1,
+    "stop_on_defense": True,
+}
+
+
+def passhack_defaults_path() -> Path:
+    override = os.environ.get("PASSHACK_STTOOL_DEFAULTS_PATH", "").strip()
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent / "output" / "state" / "sttool_defaults.json"
+
+
+def effective_policy(candidate_path: Path) -> tuple[dict, dict]:
+    candidate_value = read_json(candidate_path)
+    project_policy = candidate_value.get("policy")
+    if not isinstance(project_policy, dict):
+        project_policy = {}
+    gui_path = passhack_defaults_path()
+    gui_exists = gui_path.is_file()
+    gui_policy = read_json(gui_path) if gui_exists else {}
+    policy = dict(DEFAULT_STTOOL_POLICY)
+    if gui_policy:
+        policy.update(
+            {key: gui_policy[key] for key in DEFAULT_STTOOL_POLICY if key in gui_policy}
+        )
+    project_override = bool(project_policy.get("project_override", False))
+    if project_override:
+        policy.update(
+            {key: project_policy[key] for key in DEFAULT_STTOOL_POLICY if key in project_policy}
+        )
+        policy["brute_enabled"] = True
+        source = "STTool ????"
+    else:
+        source = "PassHack GUI ????" if gui_exists else "PassHack ???????"
+    summary = {
+        "source": source,
+        "defaults_path": str(gui_path),
+        "project_override": project_override,
+        "brute_enabled": bool(policy.get("brute_enabled", True)),
+        "username_wordlist_path": str(policy.get("username_wordlist_path") or ""),
+        "wordlist_path": str(policy.get("wordlist_path") or ""),
+        "max_attempts": max(1, int(policy.get("max_attempts") or 10)),
+        "requests_per_minute": max(1, int(policy.get("requests_per_minute") or 10)),
+        "concurrency": max(1, int(policy.get("concurrency") or 1)),
+        "stop_on_defense": bool(policy.get("stop_on_defense", True)),
+    }
+    return policy, summary
+
+
 def atomic_write(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -302,12 +357,20 @@ def verify_approved_login(
         requests_per_minute=max(1, int(policy.get("requests_per_minute") or 10)),
         stop_on_defense=bool(policy.get("stop_on_defense", True)),
     )
-    usernames = [str(item).strip() for item in candidate.get("username_candidates") or [] if str(item).strip()]
+    usernames = [
+        str(item).strip()
+        for item in candidate.get("username_candidates") or []
+        if str(item).strip()
+    ]
+    usernames.extend(_read_wordlist(str(policy.get("username_wordlist_path") or "")))
+    usernames = list(dict.fromkeys(usernames))
     if usernames:
         handler.default_user = usernames[:max_attempts]
     else:
         handler.default_user = handler.default_user[:1]
-    custom_passwords = _read_wordlist(str(candidate.get("wordlist_path") or ""))
+    custom_passwords = _read_wordlist(
+        str(candidate.get("wordlist_path") or policy.get("wordlist_path") or "")
+    )
     if custom_passwords:
         handler.default_pass = custom_passwords
     elif str(candidate.get("action") or "") == "agent_social_dictionary":
@@ -340,7 +403,14 @@ def update_candidate(candidate_path: Path, identity: str, **updates: object) -> 
     atomic_write(candidate_path, value)
 
 
-def process_candidate(candidate: dict, args: argparse.Namespace, candidate_path: Path) -> dict:
+def process_candidate(
+    candidate: dict,
+    args: argparse.Namespace,
+    candidate_path: Path,
+    policy: dict | None = None,
+) -> dict:
+    if policy is None:
+        policy, _summary = effective_policy(candidate_path)
     identity = str(candidate.get("id") or "")
     url = str(candidate.get("url") or "")
     if not host_allowed(url, args.scope, args.target):
@@ -354,10 +424,10 @@ def process_candidate(candidate: dict, args: argparse.Namespace, candidate_path:
             update_candidate(candidate_path, identity, status="completed", tool="passhack", result=result["result"], completed_at=now_text())
             return result
         action = str(candidate.get("action") or "save_only")
-        policy = read_json(candidate_path).get("policy")
-        if not isinstance(policy, dict):
-            policy = {}
-        result_text = verify_approved_login(record, session, soup, candidate, policy)
+        if not bool(policy.get("brute_enabled", True)):
+            result_text = "PassHack GUI ????????????????????????"
+        else:
+            result_text = verify_approved_login(record, session, soup, candidate, policy)
         result_status = (
             "stopped_defense"
             if result_text.startswith("已停止")
@@ -420,8 +490,10 @@ def run(args: argparse.Namespace) -> int:
                     approved_waiting=len(approved),
                     updated_at=now_text(),
                 )
+                policy, config_summary = effective_policy(candidate_path)
+                state["effective_config"] = config_summary
                 atomic_write(state_path, state)
-                result = process_candidate(candidate, args, candidate_path)
+                result = process_candidate(candidate, args, candidate_path, policy)
                 processed.add(identity)
                 results.append(result)
                 append_log(
