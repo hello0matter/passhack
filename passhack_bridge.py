@@ -274,8 +274,20 @@ def requeue_scope_skips(
     return changed
 
 
+def socks5_available() -> bool:
+    try:
+        __import__("socks")
+    except ImportError:
+        return False
+    return True
+
+
 def configure_session(session: requests.Session) -> None:
     proxy_url = os.environ.get("STTOOL_TOOL_PROXY_URL", "").strip()
+    if proxy_url.startswith(("socks5://", "socks5h://")) and not socks5_available():
+        proxy_url = os.environ.get(
+            "STTOOL_TOOL_HTTP_FALLBACK_PROXY_URL", ""
+        ).strip()
     if proxy_url:
         session.proxies.update({"http": proxy_url, "https": proxy_url})
     header_name = os.environ.get("STTOOL_HTTP_HEADER_NAME", "").strip()
